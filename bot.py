@@ -52,7 +52,6 @@ async def init_db():
             mode_sold TEXT,
             purchase_date TEXT DEFAULT (DATETIME('now', 'localtime'))
         );""")
-        # === NEW INSTRUCTIONS TABLE ===
         await db.execute("""CREATE TABLE IF NOT EXISTS instructions(
             category TEXT PRIMARY KEY,
             message_text TEXT NOT NULL
@@ -155,14 +154,14 @@ async def delete_stock_id(stock_id: int) -> int:
 
 async def clear_stock_category(category: str) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("DELETE FROM stock WHERE category=? AND IFNULL(is_sold,0)=0", (category,))
+        cur = await db.execute("DELETE FROM stock WHERE category=?", (category,))
         await db.commit()
         return cur.rowcount
 
 async def list_stock_items(category: str, limit: int = 20):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("""
-            SELECT id, price, credential FROM stock
+            SELECT id, price, credential, p_price, s_price, l_price FROM stock
             WHERE IFNULL(is_sold,0)=0 AND category=?
             ORDER BY id ASC
             LIMIT ?
@@ -185,7 +184,7 @@ async def list_categories():
         cur = await db.execute("""
             SELECT category,
                    SUM(CASE
-                       WHEN (chosen_mode IS NULL AND (IFNULL(p_cap,0)>0 OR IFNULL(s_cap,0)>0 OR IFNULL(l_cap,0)>0))
+                       WHEN (chosen_mode IS NULL AND (IFNULL(p_cap,0)>IFNULL(p_sold,0) OR IFNULL(s_cap,0)>IFNULL(s_sold,0) OR IFNULL(l_cap,0)>IFNULL(l_sold,0)))
                          OR (chosen_mode='personal' AND IFNULL(p_cap,0) > IFNULL(p_sold,0))
                          OR (chosen_mode='shared'  AND IFNULL(s_cap,0) > IFNULL(s_sold,0))
                          OR (chosen_mode='laptop'  AND IFNULL(l_cap,0) > IFNULL(l_sold,0))
@@ -289,7 +288,6 @@ async def get_sales_history(limit: int = 20):
         """, (limit,))
         return await cur.fetchall()
 
-# === NEW INSTRUCTIONS HELPERS ===
 async def set_instruction(category: str, message: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -407,7 +405,7 @@ async def clearstock_cmd(m: Message, command: CommandObject):
     if not is_admin(m.from_user.id): return
     if not command.args: await m.reply("⚠️ الاستخدام: /clearstock <category>"); return
     count = await clear_stock_category(command.args.strip())
-    await m.reply(f"🧹 تم حذف {count} عنصر غير مباع.")
+    await m.reply(f"🧹 تم حذف {count} عنصر.")
 
 @dp.message(Command("liststock"))
 async def liststock_cmd(m: Message, command: CommandObject):
@@ -420,7 +418,11 @@ async def liststock_cmd(m: Message, command: CommandObject):
         limit = max(1, min(maybe, 200))
     rows = await list_stock_items(category, limit)
     if not rows: await m.reply("لا يوجد عناصر في هذه الفئة."); return
-    lines = [f"أول {len(rows)} عنصر ({category}):"] + [f"- ID={sid} | {price:g}$ | {cred}" for sid, price, cred in rows]
+    lines = [f"أول {len(rows)} عنصر ({category}):"]
+    for row in rows:
+        sid, price, cred, p_p, s_p, l_p = row
+        prices = f"P:{p_p or 'N/A'}|S:{s_p or 'N/A'}|L:{l_p or 'N/A'}"
+        lines.append(f"- ID={sid} | {prices} | {cred}")
     await m.reply("\n".join(lines))
 
 @dp.message(Command("stock"))
@@ -445,7 +447,6 @@ async def sales_history_cmd(m: Message, command: CommandObject):
         lines.append(f"👤 `{uid}`\n🛍️ `{cat}` ({mode}) | {price:g}$\n🗓️ {pdate}\n`{cred}`\n---")
     await m.reply("\n".join(lines), parse_mode="Markdown")
 
-# === NEW ADMIN COMMANDS FOR INSTRUCTIONS ===
 @dp.message(Command("setinstructions"))
 async def setinstructions_cmd(m: Message):
     if not is_admin(m.from_user.id): return
@@ -523,11 +524,22 @@ async def importstockm_cmd(m: Message):
     await m.reply("📥 أرسل TXT أو الصق سطور بصيغة:\n<cat> <p_p> <p_c> <s_p> <s_c> <l_p> <l_c> <cred>")
     dp.workflow_state = {"awaiting_importm": {"admin": m.from_user.id}}
 
+async def process_import(text: str, is_multi_mode: bool):
+    if is_multi_mode:
+        rows, ok, fail = parse_stockm_lines(text)
+        for cat, p_price, p_cap, s_price, s_cap, l_price, l_cap, cred in rows:
+            await add_stock_row_modes(cat, cred, p_price, p_cap, s_price, s_cap, l_price, l_cap)
+        return f"✅ تم استيراد {ok} (مودات). ❌ فشل {fail}."
+    else:
+        rows, ok, fail = parse_stock_lines(text)
+        for cat, price, cred in rows:
+            await add_stock_simple(cat, price, cred)
+        return f"✅ تم استيراد {ok}. ❌ فشل {fail}."
+
 @dp.message(F.document)
 async def import_file_handler(m: Message):
     st = getattr(dp, "workflow_state", {})
-    w_m = st.get("awaiting_importm")
-    w_s = st.get("awaiting_import")
+    w_m = st.get("awaiting_importm"); w_s = st.get("awaiting_import")
     if not (w_m or w_s) or not is_admin(m.from_user.id): return
     if (w_m and w_m.get("admin") != m.from_user.id) or \
        (w_s and w_s.get("admin") != m.from_user.id): return
@@ -543,27 +555,20 @@ async def import_file_handler(m: Message):
     except Exception as e:
         await m.reply(f"❌ فشل تنزيل الملف: {e}"); return
     
-    parser, adder, suffix = (parse_stockm_lines, add_stock_row_modes, " (مودات)") if w_m else (parse_stock_lines, add_stock_simple, "")
-    rows, ok, fail = parser(text)
-    for row_data in rows:
-        await adder(*row_data)
-    await m.reply(f"✅ تم استيراد {ok}{suffix}. ❌ فشل {fail}.")
+    reply_msg = await process_import(text, is_multi_mode=bool(w_m))
+    await m.reply(reply_msg)
     dp.workflow_state = {}
 
 @dp.message()
 async def pasted_imports(m: Message):
     st = getattr(dp, "workflow_state", {})
-    w_m = st.get("awaiting_importm")
-    w_s = st.get("awaiting_import")
+    w_m = st.get("awaiting_importm"); w_s = st.get("awaiting_import")
     if not (w_m or w_s) or not is_admin(m.from_user.id): return
     if (w_m and w_m.get("admin") != m.from_user.id) or \
        (w_s and w_s.get("admin") != m.from_user.id): return
-
-    parser, adder, suffix = (parse_stockm_lines, add_stock_row_modes, " (مودات)") if w_m else (parse_stock_lines, add_stock_simple, "")
-    rows, ok, fail = parser(m.text or "")
-    for row_data in rows:
-        await adder(*row_data)
-    await m.reply(f"✅ تم استيراد {ok}{suffix}. ❌ فشل {fail}.")
+    
+    reply_msg = await process_import(m.text or "", is_multi_mode=bool(w_m))
+    await m.reply(reply_msg)
     dp.workflow_state = {}
 
 # ==================== CATALOG & BUY ====================
@@ -592,7 +597,7 @@ def modes_kb(modes_info, category):
 async def cb_pick_category(c: CallbackQuery):
     category = c.data.split("::",1)[1]
     modes_info = await list_modes_for_category(category)
-    if not modes_info: await c.answer("لا يوجد عناصر متاحة.", show_alert=True); return
+    if not modes_info: await c.answer("لا يوجد عناصر متاحة في هذه الفئة حاليًا.", show_alert=True); return
     await c.message.edit_text(f"الفئة: {category}\nاختر النوع:", reply_markup=modes_kb(modes_info, category))
 
 @dp.callback_query(F.data.startswith("mode::"))
@@ -627,7 +632,6 @@ async def cb_buy(c: CallbackQuery):
     await log_sale(c.from_user.id, row, price, mode)
     credential = escape(row[3])
     
-    # === MODIFIED: FETCH AND SEND INSTRUCTIONS ===
     instructions = await get_instruction(category)
     message_text = f"📩 <b>بيانات حسابك:</b>\n<code>{credential}</code>"
     if instructions:
