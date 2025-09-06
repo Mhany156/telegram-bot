@@ -1,17 +1,29 @@
-import os, asyncio, re
+import os
+import asyncio
+import re
+import json
+import time
 from html import escape
-from dotenv import load_dotenv
-load_dotenv()
 
+from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Document
 )
+import aiohttp
+import aiosqlite
 
 # ==================== CONFIG ====================
+load_dotenv()
+
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
+
+# --- تحميل متغيرات Paymob ---
+PAYMOB_API_KEY = os.getenv("PAYMOB_API_KEY")
+PAYMOB_CARD_ID = int(os.getenv("PAYMOB_CARD_INTEGRATION_ID", 0))
+PAYMOB_WALLET_ID = int(os.getenv("PAYMOB_WALLET_INTEGRATION_ID", 0))
 
 if not TOKEN:
     raise RuntimeError("Please set TELEGRAM_TOKEN in .env")
@@ -22,7 +34,6 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 # ==================== DB ====================
-import aiosqlite
 DB_PATH = "store.db"
 
 async def init_db():
@@ -52,7 +63,6 @@ async def init_db():
             mode_sold TEXT,
             purchase_date TEXT DEFAULT (DATETIME('now', 'localtime'))
         );""")
-        # === MODIFIED INSTRUCTIONS TABLE FOR MODES ===
         await db.execute("""CREATE TABLE IF NOT EXISTS instructions(
             category TEXT NOT NULL,
             mode TEXT NOT NULL,
@@ -101,7 +111,7 @@ def parse_int_loose(s: str):
 
 def main_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 شحن الرصيد (يدوي)", callback_data="topup")],
+        [InlineKeyboardButton(text="💳 شحن الرصيد (آلي)", callback_data="charge_menu")],
         [InlineKeyboardButton(text="🛍️ الكتالوج / شراء", callback_data="catalog")],
         [InlineKeyboardButton(text="💼 رصيدي", callback_data="balance")],
     ])
@@ -148,12 +158,6 @@ async def add_stock_row_modes(category: str, credential: str,
 
 async def add_stock_simple(category: str, price: float, credential: str):
     await add_stock_row_modes(category, credential, p_price=price, p_cap=1)
-
-async def delete_stock_id(stock_id: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("DELETE FROM stock WHERE id=? AND IFNULL(is_sold,0)=0", (stock_id,))
-        await db.commit()
-        return cur.rowcount
 
 async def clear_stock_category(category: str) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -291,7 +295,6 @@ async def get_sales_history(limit: int = 20):
         """, (limit,))
         return await cur.fetchall()
 
-# === MODIFIED INSTRUCTIONS HELPERS FOR MODES ===
 async def set_instruction(category: str, mode: str, message: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -337,73 +340,29 @@ async def cb_balance(c: CallbackQuery):
     bal = await get_or_create_user(c.from_user.id)
     await c.message.edit_text(f"رصيدك الحالي: {bal:g}$", reply_markup=main_menu_kb())
 
-@dp.callback_query(F.data == "topup")
-async def cb_topup(c: CallbackQuery):
-    await c.message.edit_text(
-        "أرسل إثبات الدفع هنا وسيصل للأدمن لإضافة الرصيد يدويًا.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 رجوع", callback_data="back_home")]
-        ])
-    )
+@dp.callback_query(F.data == "charge_menu")
+async def cb_charge_menu(c: CallbackQuery):
+    await c.message.edit_text("لشحن رصيدك، استخدم الأمر التالي في الشات مباشرة:\n`/charge <amount>`\n\n**مثال:**\n`/charge 100` لشحن 100 جنيه.", parse_mode="Markdown")
 
 @dp.callback_query(F.data == "back_home")
 async def cb_back_home(c: CallbackQuery):
     await c.message.edit_text("اختر من القائمة:", reply_markup=main_menu_kb())
 
 # ==================== ADMIN: BALANCE ====================
-async def handle_addbal_text(m: Message):
+@dp.message(Command("addbal"))
+async def addbal_cmd(m: Message, command: CommandObject):
     if not is_admin(m.from_user.id): return
-    parts = (m.text or "").strip().split(maxsplit=2)
-    if len(parts) < 3:
+    if not command.args:
         await m.reply("⚠️ الاستخدام: /addbal <user_id> <amount>"); return
-    uid = parse_int_loose(parts[1]); amt = parse_float_loose(parts[2])
+    parts = command.args.split(maxsplit=1)
+    uid = parse_int_loose(parts[0])
+    amt = parse_float_loose(parts[1]) if len(parts) > 1 else None
     if uid is None or amt is None:
         await m.reply("⚠️ اكتب ID صحيح ومبلغ رقمي."); return
     await change_balance(uid, amt)
     await m.reply("✅ تم الشحن.")
 
-@dp.message(Command("addbal"))
-async def addbal_cmd(m: Message, command: CommandObject): await handle_addbal_text(m)
-@dp.message(F.text.regexp(r'^/addbal\b'))
-async def addbal_fallback(m: Message): await handle_addbal_text(m)
-
-# ==================== ADMIN: ADD STOCK ====================
-@dp.message(Command("addstock"))
-async def addstock_cmd(m: Message, command: CommandObject):
-    if not is_admin(m.from_user.id): return
-    parts = (m.text or "").strip().split(maxsplit=3)
-    if len(parts) < 4:
-        await m.reply("⚠️ الاستخدام: /addstock <category> <price> <credential>"); return
-    category, price_str, credential = parts[1], parts[2], parts[3]
-    price = parse_float_loose(price_str)
-    if price is None: await m.reply("⚠️ السعر لازم يكون رقم."); return
-    await add_stock_simple(category, price, credential)
-    await m.reply("✅ تمت إضافة عنصر (فردي، cap=1).")
-
-@dp.message(Command("addstockm"))
-async def addstockm_cmd(m: Message, command: CommandObject):
-    if not is_admin(m.from_user.id): return
-    if not command.args:
-        await m.reply("⚠️ الاستخدام: /addstockm <category> <p_price> <p_cap> <s_price> <s_cap> <l_price> <l_cap> <credential>"); return
-    parts = command.args.split(maxsplit=7)
-    if len(parts) < 8: await m.reply("⚠️ ناقص مدخلات."); return
-    category = parts[0]
-    p_price = parse_float_loose(parts[1]); p_cap = parse_int_loose(parts[2])
-    s_price = parse_float_loose(parts[3]); s_cap = parse_int_loose(parts[4])
-    l_price = parse_float_loose(parts[5]); l_cap = parse_int_loose(parts[6])
-    credential = parts[7]
-    await add_stock_row_modes(category, credential, p_price, p_cap, s_price, s_cap, l_price, l_cap)
-    await m.reply("✅ تم إضافة عنصر متعدد الأنماط.")
-
-# ==================== ADMIN: MANAGE STOCK & SALES ====================
-@dp.message(Command("delstock"))
-async def delstock_cmd(m: Message, command: CommandObject):
-    if not is_admin(m.from_user.id): return
-    if not command.args or not (sid := parse_int_loose(command.args)):
-        await m.reply("⚠️ الاستخدام: /delstock <id>"); return
-    deleted = await delete_stock_id(sid)
-    await m.reply("✅ تم الحذف." if deleted else "⚠️ غير موجود/مباع.")
-
+# ==================== ADMIN: STOCK & SALES ====================
 @dp.message(Command("clearstock"))
 async def clearstock_cmd(m: Message, command: CommandObject):
     if not is_admin(m.from_user.id): return
@@ -451,7 +410,7 @@ async def sales_history_cmd(m: Message, command: CommandObject):
         lines.append(f"👤 `{uid}`\n🛍️ `{cat}` ({mode}) | {price:g}$\n🗓️ {pdate}\n`{cred}`\n---")
     await m.reply("\n".join(lines), parse_mode="Markdown")
 
-# === MODIFIED ADMIN COMMANDS FOR INSTRUCTIONS ===
+# ==================== ADMIN: INSTRUCTIONS ====================
 @dp.message(Command("setinstructions"))
 async def setinstructions_cmd(m: Message):
     if not is_admin(m.from_user.id): return
@@ -504,7 +463,19 @@ async def viewinstructions_cmd(m: Message, command: CommandObject):
             lines.append(f"\n--- <b>{escape(cat)} ({escape(md)})</b> ---\n{text}")
         await m.reply("\n".join(lines), parse_mode="HTML")
 
-# ==================== IMPORT (simple & multi-mode) ====================
+# ==================== IMPORT LOGIC ====================
+@dp.message(Command("importstock"))
+async def importstock_cmd(m: Message):
+    if not is_admin(m.from_user.id): return
+    await m.reply("📥 أرسل ملف TXT أو الصق سطور بصيغة:\n<category> <price> <credential>")
+    dp.workflow_state = {"awaiting_import": {"admin": m.from_user.id}}
+
+@dp.message(Command("importstockm"))
+async def importstockm_cmd(m: Message):
+    if not is_admin(m.from_user.id): return
+    await m.reply("📥 أرسل TXT أو الصق سطور بصيغة:\n<cat> <p_p> <p_c> <s_p> <s_c> <l_p> <l_c> <cred>")
+    dp.workflow_state = {"awaiting_importm": {"admin": m.from_user.id}}
+
 def parse_stock_lines(text: str):
     ok, fail, res = 0, 0, []
     for raw in (text or "").splitlines():
@@ -532,19 +503,7 @@ def parse_stockm_lines(text: str):
         if any(v is None for v in [p_price,p_cap,s_price,s_cap,l_price,l_cap]): fail += 1; continue
         results.append((cat, p_price, p_cap, s_price, s_cap, l_price, l_cap, cred)); ok += 1
     return results, ok, fail
-
-@dp.message(Command("importstock"))
-async def importstock_cmd(m: Message):
-    if not is_admin(m.from_user.id): return
-    await m.reply("📥 أرسل ملف TXT أو الصق سطور بصيغة:\n<category> <price> <credential>")
-    dp.workflow_state = {"awaiting_import": {"admin": m.from_user.id}}
-
-@dp.message(Command("importstockm"))
-async def importstockm_cmd(m: Message):
-    if not is_admin(m.from_user.id): return
-    await m.reply("📥 أرسل TXT أو الصق سطور بصيغة:\n<cat> <p_p> <p_c> <s_p> <s_c> <l_p> <l_c> <cred>")
-    dp.workflow_state = {"awaiting_importm": {"admin": m.from_user.id}}
-
+    
 async def process_import(text: str, is_multi_mode: bool, message: Message):
     if is_multi_mode:
         rows, ok, fail = parse_stockm_lines(text)
@@ -578,15 +537,81 @@ async def import_file_handler(m: Message):
     await process_import(text, is_multi_mode=bool(w_m), message=m)
     dp.workflow_state = {}
 
-@dp.message()
-async def pasted_imports(m: Message):
-    st = getattr(dp, "workflow_state", {})
-    w_m = st.get("awaiting_importm"); w_s = st.get("awaiting_import")
-    if not (w_m or w_s) or not is_admin(m.from_user.id): return
-    if (w_m and w_m.get("admin") != m.from_user.id) or \
-       (w_s and w_s.get("admin") != m.from_user.id): return
-    await process_import(m.text or "", is_multi_mode=bool(w_m), message=m)
-    dp.workflow_state = {}
+# ==================== PAYMOB INTEGRATION ====================
+PAYMOB_AUTH_URL = "https://accept.paymob.com/api/auth/tokens"
+PAYMOB_ORDER_URL = "https://accept.paymob.com/api/ecommerce/orders"
+PAYMOB_PAYMENT_KEY_URL = "https://accept.paymob.com/api/acceptance/payment_keys"
+PAYMOB_IFRAME_URL = "https://accept.paymob.com/api/acceptance/iframes/836183?payment_token={}"
+
+async def get_auth_token():
+    """الخطوة الأولى: الحصول على توكن المصادقة"""
+    async with aiohttp.ClientSession() as session:
+        async with session.post(PAYMOB_AUTH_URL, json={"api_key": PAYMOB_API_KEY}) as response:
+            data = await response.json()
+            return data.get("token")
+
+async def register_order(token: str, merchant_order_id: str, amount_cents: int):
+    """الخطوة الثانية: تسجيل الطلب"""
+    payload = {
+        "auth_token": token, "delivery_needed": "false", "amount_cents": str(amount_cents),
+        "currency": "EGP", "merchant_order_id": merchant_order_id,
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(PAYMOB_ORDER_URL, json=payload) as response:
+            data = await response.json()
+            return data.get("id")
+
+async def get_payment_key(token: str, order_id: int, amount_cents: int, integration_id: int, user_details: dict):
+    """الخطوة الثالثة: الحصول على مفتاح الدفع النهائي"""
+    payload = {
+        "auth_token": token, "amount_cents": str(amount_cents), "expiration": 3600, "order_id": order_id,
+        "billing_data": {
+            "email": user_details.get("email", "NA"), "first_name": user_details.get("first_name", "NA"),
+            "last_name": user_details.get("last_name", "NA"), "phone_number": user_details.get("phone_number", "NA"),
+            "apartment": "NA", "floor": "NA", "street": "NA", "building": "NA", "shipping_method": "NA",
+            "postal_code": "NA", "city": "NA", "country": "NA", "state": "NA"
+        },
+        "currency": "EGP", "integration_id": integration_id, "lock_order_when_paid": "true"
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(PAYMOB_PAYMENT_KEY_URL, json=payload) as response:
+            data = await response.json()
+            return data.get("token")
+
+@dp.message(Command("charge"))
+async def charge_cmd(m: Message, command: CommandObject):
+    if not command.args:
+        await m.reply("⚠️ الاستخدام: /charge <amount>\nمثال: /charge 50"); return
+    amount_egp = parse_float_loose(command.args)
+    if amount_egp is None or amount_egp <= 1:
+        await m.reply("⚠️ المبلغ يجب أن يكون رقمًا صحيحًا وأكبر من 1."); return
+    amount_cents = int(amount_egp * 100)
+    merchant_order_id = f"tg-{m.from_user.id}-{int(time.time())}"
+    
+    try:
+        token = await get_auth_token()
+        if not token: raise Exception("Failed to get auth token")
+        order_id = await register_order(token, merchant_order_id, amount_cents)
+        if not order_id: raise Exception("Failed to register order")
+        
+        payment_key = await get_payment_key(
+            token=token, order_id=order_id, amount_cents=amount_cents,
+            integration_id=PAYMOB_CARD_ID,
+            user_details={
+                "email": f"{m.from_user.id}@telegram.bot", "first_name": m.from_user.first_name or "Telegram",
+                "last_name": m.from_user.last_name or "User", "phone_number": f"+201000000000"
+            }
+        )
+        if not payment_key: raise Exception("Failed to get payment key")
+        
+        payment_url = PAYMOB_IFRAME_URL.format(payment_key)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"💳 ادفع {amount_egp:g} جنيه الآن", url=payment_url)]
+        ])
+        await m.reply("تم إنشاء فاتورة الدفع. اضغط على الزر أدناه لإتمام العملية.", reply_markup=kb)
+    except Exception as e:
+        print("[PAYMOB ERROR]", e)
+        await m.reply("حدث خطأ أثناء إنشاء فاتورة الدفع. يرجى المحاولة مرة أخرى لاحقًا.")
 
 # ==================== CATALOG & BUY ====================
 @dp.callback_query(F.data == "catalog")
@@ -649,12 +674,10 @@ async def cb_buy(c: CallbackQuery):
     await log_sale(c.from_user.id, row, price, mode)
     credential = escape(row[3])
     
-    # === MODIFIED: FETCH AND SEND MODE-SPECIFIC INSTRUCTIONS ===
     instructions = await get_instruction(category, mode)
     message_text = f"📩 <b>بيانات حسابك:</b>\n<code>{credential}</code>"
     if instructions:
         message_text += f"\n\n{instructions}"
-
     try:
         await bot.send_message(c.from_user.id, message_text, parse_mode="HTML")
     except Exception: pass
@@ -669,6 +692,18 @@ async def main():
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
         print("[WARN] delete_webhook:", e)
+    
+    # This will catch all other text messages
+    @dp.message()
+    async def pasted_imports(m: Message):
+        st = getattr(dp, "workflow_state", {})
+        w_m = st.get("awaiting_importm"); w_s = st.get("awaiting_import")
+        if not (w_m or w_s) or not is_admin(m.from_user.id): return
+        if (w_m and w_m.get("admin") != m.from_user.id) or \
+           (w_s and w_s.get("admin") != m.from_user.id): return
+        await process_import(m.text or "", is_multi_mode=bool(w_m), message=m)
+        dp.workflow_state = {}
+
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
