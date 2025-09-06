@@ -52,9 +52,12 @@ async def init_db():
             mode_sold TEXT,
             purchase_date TEXT DEFAULT (DATETIME('now', 'localtime'))
         );""")
+        # === MODIFIED INSTRUCTIONS TABLE FOR MODES ===
         await db.execute("""CREATE TABLE IF NOT EXISTS instructions(
-            category TEXT PRIMARY KEY,
-            message_text TEXT NOT NULL
+            category TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            message_text TEXT NOT NULL,
+            PRIMARY KEY (category, mode)
         );""")
         await db.commit()
     await migrate_db()
@@ -288,29 +291,30 @@ async def get_sales_history(limit: int = 20):
         """, (limit,))
         return await cur.fetchall()
 
-async def set_instruction(category: str, message: str):
+# === MODIFIED INSTRUCTIONS HELPERS FOR MODES ===
+async def set_instruction(category: str, mode: str, message: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
-            INSERT INTO instructions(category, message_text) VALUES (?, ?)
-            ON CONFLICT(category) DO UPDATE SET message_text=excluded.message_text
-        """, (category, message))
+            INSERT INTO instructions(category, mode, message_text) VALUES (?, ?, ?)
+            ON CONFLICT(category, mode) DO UPDATE SET message_text=excluded.message_text
+        """, (category, mode, message))
         await db.commit()
 
-async def get_instruction(category: str):
+async def get_instruction(category: str, mode: str):
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT message_text FROM instructions WHERE category=?", (category,))
+        cur = await db.execute("SELECT message_text FROM instructions WHERE category=? AND mode=?", (category, mode))
         row = await cur.fetchone()
         return row[0] if row else None
 
-async def delete_instruction(category: str) -> int:
+async def delete_instruction(category: str, mode: str) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("DELETE FROM instructions WHERE category=?", (category,))
+        cur = await db.execute("DELETE FROM instructions WHERE category=? AND mode=?", (category, mode))
         await db.commit()
         return cur.rowcount
 
 async def get_all_instructions():
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT category, message_text FROM instructions ORDER BY category")
+        cur = await db.execute("SELECT category, mode, message_text FROM instructions ORDER BY category, mode")
         return await cur.fetchall()
 
 # ==================== USER HANDLERS ====================
@@ -447,40 +451,57 @@ async def sales_history_cmd(m: Message, command: CommandObject):
         lines.append(f"👤 `{uid}`\n🛍️ `{cat}` ({mode}) | {price:g}$\n🗓️ {pdate}\n`{cred}`\n---")
     await m.reply("\n".join(lines), parse_mode="Markdown")
 
+# === MODIFIED ADMIN COMMANDS FOR INSTRUCTIONS ===
 @dp.message(Command("setinstructions"))
 async def setinstructions_cmd(m: Message):
     if not is_admin(m.from_user.id): return
-    parts = (m.text or "").split(maxsplit=2)
-    if len(parts) < 3:
-        await m.reply("⚠️ الاستخدام: /setinstructions <category> <message>\nالرسالة تدعم HTML.")
+    parts = (m.text or "").split(maxsplit=3)
+    valid_modes = ["personal", "shared", "laptop"]
+    if len(parts) < 4:
+        await m.reply(f"⚠️ الاستخدام: /setinstructions <category> <mode> <message>\nالأنماط المتاحة: {', '.join(valid_modes)}")
         return
-    category, message = parts[1], parts[2]
-    await set_instruction(category, message)
-    await m.reply(f"✅ تم حفظ التعليمات للفئة: {category}")
+    category, mode, message = parts[1], parts[2].lower(), parts[3]
+    if mode not in valid_modes:
+        await m.reply(f"⚠️ نمط غير صحيح. الأنماط المتاحة: {', '.join(valid_modes)}")
+        return
+    await set_instruction(category, mode, message)
+    await m.reply(f"✅ تم حفظ التعليمات لـ: {category} ({mode})")
 
 @dp.message(Command("delinstructions"))
 async def delinstructions_cmd(m: Message, command: CommandObject):
     if not is_admin(m.from_user.id): return
-    if not command.args:
-        await m.reply("⚠️ الاستخدام: /delinstructions <category>"); return
-    category = command.args.strip()
-    deleted = await delete_instruction(category)
-    await m.reply(f"✅ تم حذف التعليمات." if deleted else "⚠️ لا توجد تعليمات لهذه الفئة.")
+    parts = (command.args or "").strip().split(maxsplit=1)
+    if len(parts) < 2:
+        await m.reply("⚠️ الاستخدام: /delinstructions <category> <mode>"); return
+    category, mode = parts[0], parts[1].lower()
+    deleted = await delete_instruction(category, mode)
+    await m.reply(f"✅ تم حذف التعليمات." if deleted else "⚠️ لا توجد تعليمات لهذه الفئة والنمط.")
 
 @dp.message(Command("viewinstructions"))
 async def viewinstructions_cmd(m: Message, command: CommandObject):
     if not is_admin(m.from_user.id): return
     if command.args:
-        category = command.args.strip()
-        msg = await get_instruction(category)
-        if not msg: await m.reply("لا توجد تعليمات لهذه الفئة."); return
-        await m.reply(f"<b>تعليمات فئة: {escape(category)}</b>\n\n{msg}", parse_mode="HTML")
+        parts = command.args.strip().split(maxsplit=1)
+        category = parts[0]
+        if len(parts) == 2:
+            mode = parts[1].lower()
+            msg = await get_instruction(category, mode)
+            if not msg: await m.reply("لا توجد تعليمات لهذه الفئة والنمط."); return
+            await m.reply(f"<b>تعليمات: {escape(category)} ({escape(mode)})</b>\n\n{msg}", parse_mode="HTML")
+        else:
+            all_inst = await get_all_instructions()
+            cat_inst = [i for i in all_inst if i[0] == category]
+            if not cat_inst: await m.reply("لا توجد تعليمات لهذه الفئة."); return
+            lines = [f"📜 <b>تعليمات فئة: {escape(category)}</b>"]
+            for cat, md, text in cat_inst:
+                lines.append(f"\n--- <b>{escape(md)}</b> ---\n{text}")
+            await m.reply("\n".join(lines), parse_mode="HTML")
     else:
         all_inst = await get_all_instructions()
         if not all_inst: await m.reply("لا توجد أي تعليمات محفوظة."); return
         lines = ["📜 <b>جميع التعليمات المحفوظة:</b>"]
-        for cat, text in all_inst:
-            lines.append(f"\n--- <b>{escape(cat)}</b> ---\n{text}")
+        for cat, md, text in all_inst:
+            lines.append(f"\n--- <b>{escape(cat)} ({escape(md)})</b> ---\n{text}")
         await m.reply("\n".join(lines), parse_mode="HTML")
 
 # ==================== IMPORT (simple & multi-mode) ====================
@@ -524,17 +545,17 @@ async def importstockm_cmd(m: Message):
     await m.reply("📥 أرسل TXT أو الصق سطور بصيغة:\n<cat> <p_p> <p_c> <s_p> <s_c> <l_p> <l_c> <cred>")
     dp.workflow_state = {"awaiting_importm": {"admin": m.from_user.id}}
 
-async def process_import(text: str, is_multi_mode: bool):
+async def process_import(text: str, is_multi_mode: bool, message: Message):
     if is_multi_mode:
         rows, ok, fail = parse_stockm_lines(text)
         for cat, p_price, p_cap, s_price, s_cap, l_price, l_cap, cred in rows:
             await add_stock_row_modes(cat, cred, p_price, p_cap, s_price, s_cap, l_price, l_cap)
-        return f"✅ تم استيراد {ok} (مودات). ❌ فشل {fail}."
+        await message.reply(f"✅ تم استيراد {ok} (مودات). ❌ فشل {fail}.")
     else:
         rows, ok, fail = parse_stock_lines(text)
         for cat, price, cred in rows:
             await add_stock_simple(cat, price, cred)
-        return f"✅ تم استيراد {ok}. ❌ فشل {fail}."
+        await message.reply(f"✅ تم استيراد {ok}. ❌ فشل {fail}.")
 
 @dp.message(F.document)
 async def import_file_handler(m: Message):
@@ -554,9 +575,7 @@ async def import_file_handler(m: Message):
         text = buf.getvalue().decode("utf-8", "ignore")
     except Exception as e:
         await m.reply(f"❌ فشل تنزيل الملف: {e}"); return
-    
-    reply_msg = await process_import(text, is_multi_mode=bool(w_m))
-    await m.reply(reply_msg)
+    await process_import(text, is_multi_mode=bool(w_m), message=m)
     dp.workflow_state = {}
 
 @dp.message()
@@ -566,9 +585,7 @@ async def pasted_imports(m: Message):
     if not (w_m or w_s) or not is_admin(m.from_user.id): return
     if (w_m and w_m.get("admin") != m.from_user.id) or \
        (w_s and w_s.get("admin") != m.from_user.id): return
-    
-    reply_msg = await process_import(m.text or "", is_multi_mode=bool(w_m))
-    await m.reply(reply_msg)
+    await process_import(m.text or "", is_multi_mode=bool(w_m), message=m)
     dp.workflow_state = {}
 
 # ==================== CATALOG & BUY ====================
@@ -632,7 +649,8 @@ async def cb_buy(c: CallbackQuery):
     await log_sale(c.from_user.id, row, price, mode)
     credential = escape(row[3])
     
-    instructions = await get_instruction(category)
+    # === MODIFIED: FETCH AND SEND MODE-SPECIFIC INSTRUCTIONS ===
+    instructions = await get_instruction(category, mode)
     message_text = f"📩 <b>بيانات حسابك:</b>\n<code>{credential}</code>"
     if instructions:
         message_text += f"\n\n{instructions}"
