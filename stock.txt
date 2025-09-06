@@ -1,0 +1,10 @@
+CapCut 2.5 user1@mail.com:pass1
+CapCut 2.5 user2@mail.com:pass2
+CapCut 2.5 user3@mail.com:pass3
+CapCut 2.5 user4@mail.com:pass4
+CapCut 2.5 user5@mail.com:pass5
+CapCut 2.5 user6@mail.com:pass6
+CapCut 2.5 user7@mail.com:pass7
+CapCut 2.5 user8@mail.com:pass8
+CapCut 2.5 user9@mail.com:pass9
+CapCut 2.5 user10@mail.com:pass10

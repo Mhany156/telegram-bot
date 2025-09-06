@@ -1,0 +1,20 @@
+# Telegram Accounts Bot — Quick Commands
+
+# Admin add balance (manual top-up)
+/addbal <user_id> <amount>
+
+# Admin add one stock item
+/addstock <category> <price> <credential>
+# Example:
+/addstock Netflix 3.5 email@example.com:pass123
+
+# Show grouped stock info
+/stock
+
+# User check balance
+/balance
+
+# Flow to test purchase (as a user)
+1) Admin adds balance to your account with /addbal
+2) In bot menu: "الكتالوج / شراء" -> choose category -> "شراء بأقل سعر"
+3) Bot sends the credential and deducts balance
