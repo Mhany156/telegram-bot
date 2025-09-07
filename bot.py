@@ -24,6 +24,8 @@ ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.
 PAYMOB_API_KEY = os.getenv("PAYMOB_API_KEY")
 PAYMOB_CARD_ID = int(os.getenv("PAYMOB_CARD_INTEGRATION_ID", 0))
 PAYMOB_WALLET_ID = int(os.getenv("PAYMOB_WALLET_INTEGRATION_ID", 0))
+PAYMOB_IFRAME_ID = int(os.getenv("PAYMOB_IFRAME_ID", 0)) # إضافة متغير للـ iFrame ID
+
 
 if not TOKEN:
     raise RuntimeError("Please set TELEGRAM_TOKEN in .env")
@@ -333,12 +335,12 @@ async def whoami_cmd(m: Message):
 @dp.message(Command("balance"))
 async def balance_cmd(m: Message):
     bal = await get_or_create_user(m.from_user.id)
-    await m.answer(f"رصيدك الحالي: {bal:g}$", reply_markup=main_menu_kb())
+    await m.answer(f"رصيدك الحالي: {bal:g} ج.م", reply_markup=main_menu_kb())
 
 @dp.callback_query(F.data == "balance")
 async def cb_balance(c: CallbackQuery):
     bal = await get_or_create_user(c.from_user.id)
-    await c.message.edit_text(f"رصيدك الحالي: {bal:g}$", reply_markup=main_menu_kb())
+    await c.message.edit_text(f"رصيدك الحالي: {bal:g} ج.م", reply_markup=main_menu_kb())
 
 @dp.callback_query(F.data == "charge_menu")
 async def cb_charge_menu(c: CallbackQuery):
@@ -407,7 +409,7 @@ async def sales_history_cmd(m: Message, command: CommandObject):
     if not sales: await m.reply("لا يوجد أي سجل مبيعات."); return
     lines = [f"آخر {len(sales)} عملية بيع:"]
     for uid, cat, cred, price, mode, pdate in sales:
-        lines.append(f"👤 `{uid}`\n🛍️ `{cat}` ({mode}) | {price:g}$\n🗓️ {pdate}\n`{cred}`\n---")
+        lines.append(f"👤 `{uid}`\n🛍️ `{cat}` ({mode}) | {price:g} ج.م\n🗓️ {pdate}\n`{cred}`\n---")
     await m.reply("\n".join(lines), parse_mode="Markdown")
 
 # ==================== ADMIN: INSTRUCTIONS ====================
@@ -541,7 +543,7 @@ async def import_file_handler(m: Message):
 PAYMOB_AUTH_URL = "https://accept.paymob.com/api/auth/tokens"
 PAYMOB_ORDER_URL = "https://accept.paymob.com/api/ecommerce/orders"
 PAYMOB_PAYMENT_KEY_URL = "https://accept.paymob.com/api/acceptance/payment_keys"
-PAYMOB_IFRAME_URL = "https://accept.paymob.com/api/acceptance/iframes/113853?payment_token={}"
+PAYMOB_IFRAME_URL = f"https://accept.paymob.com/api/acceptance/iframes/{PAYMOB_IFRAME_ID}?payment_token={{}}"
 
 async def get_auth_token():
     """الخطوة الأولى: الحصول على توكن المصادقة"""
@@ -629,7 +631,7 @@ def modes_kb(modes_info, category):
         if m in modes_info:
             mi = modes_info[m]
             rows.append([InlineKeyboardButton(
-                text=f"{name[m]} — من {mi['min_price']:g}$ ({mi['count']} عنصر)",
+                text=f"{name[m]} — من {mi['min_price']:g} ج.م ({mi['count']} عنصر)",
                 callback_data=f"mode::{category}::{m}"
             )])
     rows.append([InlineKeyboardButton(text="🔙 رجوع", callback_data="catalog")])
@@ -649,7 +651,7 @@ async def cb_pick_mode(c: CallbackQuery):
     if not item: await c.answer("لا يوجد عنصر مناسب الآن.", show_alert=True); return
     price = price_for_mode(item, mode)
     await c.message.edit_text(
-        f"الفئة: {category}\nالنوع: {mode}\nالسعر: {price:g}$\nاضغط شراء لإتمام العملية.",
+        f"الفئة: {category}\nالنوع: {mode}\nالسعر: {price:g} ج.م\nاضغط شراء لإتمام العملية.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ شراء الآن", callback_data=f"buy::{category}::{mode}")],
             [InlineKeyboardButton(text="🔙 رجوع", callback_data=f"cat::{category}")]
@@ -664,7 +666,7 @@ async def cb_buy(c: CallbackQuery):
     price = price_for_mode(row, mode)
     bal = await get_or_create_user(c.from_user.id)
     if bal < price:
-        await c.answer(f"رصيدك لا يكفي. السعر {price:g}$ ورصيدك {bal:g}$", show_alert=True); return
+        await c.answer(f"رصيدك لا يكفي. السعر {price:g} ج.م ورصيدك {bal:g} ج.م", show_alert=True); return
     if not await change_balance(c.from_user.id, -price):
         await c.answer("فشل الخصم.", show_alert=True); return
     ok = await increment_sale_and_finalize(row, mode)
@@ -682,7 +684,7 @@ async def cb_buy(c: CallbackQuery):
         await bot.send_message(c.from_user.id, message_text, parse_mode="HTML")
     except Exception: pass
 
-    await c.message.edit_text(f"✅ تم الشراء: {category}\nالنوع: {mode}\nالسعر: {price:g}$\n\nتم إرسال البيانات والتعليمات في رسالة خاصة.")
+    await c.message.edit_text(f"✅ تم الشراء: {category}\nالنوع: {mode}\nالسعر: {price:g} ج.م\n\nتم إرسال البيانات والتعليمات في رسالة خاصة.")
 
 # ==================== RUN ====================
 async def main():
@@ -698,11 +700,13 @@ async def main():
     async def pasted_imports(m: Message):
         st = getattr(dp, "workflow_state", {})
         w_m = st.get("awaiting_importm"); w_s = st.get("awaiting_import")
-        if not (w_m or w_s) or not is_admin(m.from_user.id): return
-        if (w_m and w_m.get("admin") != m.from_user.id) or \
-           (w_s and w_s.get("admin") != m.from_user.id): return
-        await process_import(m.text or "", is_multi_mode=bool(w_m), message=m)
-        dp.workflow_state = {}
+        # Check if a workflow is active and if the user is the admin for that workflow
+        if (w_m and w_m.get("admin") == m.from_user.id) or \
+           (w_s and w_s.get("admin") == m.from_user.id):
+            if is_admin(m.from_user.id):
+                await process_import(m.text or "", is_multi_mode=bool(w_m), message=m)
+                dp.workflow_state = {}
+                return
 
     await dp.start_polling(bot)
 
