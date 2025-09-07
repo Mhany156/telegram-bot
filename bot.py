@@ -543,8 +543,7 @@ async def import_file_handler(m: Message):
 PAYMOB_AUTH_URL = "https://accept.paymob.com/api/auth/tokens"
 PAYMOB_ORDER_URL = "https://accept.paymob.com/api/ecommerce/orders"
 PAYMOB_PAYMENT_KEY_URL = "https://accept.paymob.com/api/acceptance/payment_keys"
-PAYMOB_IFRAME_URL = f"PAYMOB_IFRAME_URL = "https://accept.paymob.com/api/acceptance/iframes/853814?payment_token={}""
-
+PAYMOB_IFRAME_URL = f"https://accept.paymob.com/api/acceptance/iframes/{PAYMOB_IFRAME_ID}?payment_token={{}}"
 async def get_auth_token():
     """الخطوة الأولى: الحصول على توكن المصادقة"""
     async with aiohttp.ClientSession() as session:
