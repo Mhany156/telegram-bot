@@ -203,13 +203,20 @@ def paymob_webhook():
         if request.method == 'GET':
             hmac_keys = sorted([key for key in request.args.keys() if key != 'hmac'])
             concatenated_string = "".join([request.args.get(key, '') for key in hmac_keys])
+            
+            # Diagnostic print
+            print(f"[WEBHOOK-GET] String for HMAC: {concatenated_string}")
+
             received_hmac = request.args.get('hmac')
             if not received_hmac: return abort(400)
+            
             h = hmac.new(PAYMOB_HMAC_SECRET.encode('utf-8'), concatenated_string.encode('utf-8'), hashlib.sha512)
             calculated_hmac = h.hexdigest()
+
             if not hmac.compare_digest(calculated_hmac, received_hmac):
-                print("[WEBHOOK-GET] HMAC verification failed!")
+                print(f"[WEBHOOK-GET] HMAC verification failed! Received: {received_hmac}, Calculated: {calculated_hmac}")
                 return abort(403)
+            
             if request.args.get('success') == 'true':
                 print("[WEBHOOK-GET] Received successful transaction response.")
                 merchant_order_id = request.args.get('merchant_order_id')
@@ -307,7 +314,8 @@ async def cb_buy(c: CallbackQuery):
     bal = await get_or_create_user(c.from_user.id)
     if bal < price:
         await c.answer(f"رصيدك لا يكفي. السعر {price:g} ج.м ورصيدك {bal:g} ج.м", show_alert=True); return
-    if not await change_balance(c.from_user.id, -price):
+    new_balance = await change_balance(c.from_user.id, -price)
+    if new_balance is None: # Assuming change_balance returns None on failure
         await c.answer("فشل الخصم.", show_alert=True); return
     ok = await increment_sale_and_finalize(row, mode)
     if not ok:
@@ -331,7 +339,7 @@ async def addbal_cmd(m: Message, command: CommandObject):
     uid = parse_int_loose(parts[0])
     amt = parse_float_loose(parts[1]) if len(parts) > 1 else None
     if uid is None or amt is None: await m.reply("⚠️ اكتب ID صحيح ومبلغ رقمي."); return
-    await change_balance(m.from_user.id, amt)
+    await change_balance(uid, amt)
     await m.reply("✅ تم الشحن.")
 @dp.message(Command("clearstock"))
 async def clearstock_cmd(m: Message, command: CommandObject):
@@ -509,3 +517,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
