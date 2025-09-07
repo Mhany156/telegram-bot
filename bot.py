@@ -1,7 +1,6 @@
 import os
 import asyncio
 import re
-import json
 import time
 from html import escape
 
@@ -23,7 +22,7 @@ PAYMOB_CARD_ID = int(os.getenv("PAYMOB_CARD_INTEGRATION_ID", 0))
 PAYMOB_IFRAME_ID = int(os.getenv("PAYMOB_IFRAME_ID", 0))
 
 if not TOKEN: raise RuntimeError("Please set TELEGRAM_TOKEN in .env")
-print("Loaded ADMIN_IDS:", ADMIN_IDS)
+print("Bot Loaded ADMIN_IDS:", ADMIN_IDS)
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 DB_PATH = "store.db"
@@ -67,7 +66,7 @@ async def get_or_create_user(user_id: int) -> float:
         return float(r[0])
 async def find_item_with_mode(category: str, mode: str):
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT id, category, price, credential, IFNULL(is_sold,0), p_price, p_cap, IFNULL(p_sold,0), s_price, s_cap, IFNULL(s_sold,0), l_price, l_cap, IFNULL(l_sold,0), chosen_mode FROM stock WHERE category=? AND IFNULL(is_sold,0)=0 ORDER BY id ASC", (category,))
+        cur = await db.execute("SELECT * FROM stock WHERE category=? AND IFNULL(is_sold,0)=0 ORDER BY id ASC", (category,))
         items = await cur.fetchall()
     for r in items:
         chosen = r[14]
