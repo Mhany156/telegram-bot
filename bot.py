@@ -204,7 +204,6 @@ def paymob_webhook():
             hmac_keys = sorted([key for key in request.args.keys() if key != 'hmac'])
             concatenated_string = "".join([request.args.get(key, '') for key in hmac_keys])
             
-            # Diagnostic print
             print(f"[WEBHOOK-GET] String for HMAC: {concatenated_string}")
 
             received_hmac = request.args.get('hmac')
@@ -315,7 +314,7 @@ async def cb_buy(c: CallbackQuery):
     if bal < price:
         await c.answer(f"رصيدك لا يكفي. السعر {price:g} ج.м ورصيدك {bal:g} ج.м", show_alert=True); return
     new_balance = await change_balance(c.from_user.id, -price)
-    if new_balance is None: # Assuming change_balance returns None on failure
+    if new_balance is None: 
         await c.answer("فشل الخصم.", show_alert=True); return
     ok = await increment_sale_and_finalize(row, mode)
     if not ok:
