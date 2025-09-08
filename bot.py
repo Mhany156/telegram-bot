@@ -55,7 +55,9 @@ async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""CREATE TABLE IF NOT EXISTS users(
             user_id INTEGER PRIMARY KEY,
-            balance REAL DEFAULT 0
+            balance REAL DEFAULT 0,
+        email TEXT,
+        phone TEXT
         );""")
         await db.execute("""CREATE TABLE IF NOT EXISTS stock(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -144,6 +146,59 @@ def main_menu_kb():
     ])
 
 # ---- users / balances ----
+
+# ==== CONTACT MANAGEMENT ====
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+EG_PHONE_RE = re.compile(r"^\+?20?1[0-25]\d{8}$")
+
+def valid_email(s: str) -> bool:
+    return bool(EMAIL_RE.match(s or ""))
+
+def valid_phone(s: str) -> bool:
+    return bool(EG_PHONE_RE.match(normalize_digits((s or "").strip())))
+
+@dp.message(Command("setcontact"))
+async def setcontact_cmd(m: Message, state: FSMContext):
+    await state.set_state(ContactStates.waiting_email)
+    await m.reply("✉️ من فضلك أرسل بريدك الإلكتروني (مثال: name@example.com)")
+
+@dp.message(StateFilter(ContactStates.waiting_email))
+async def take_email(m: Message, state: FSMContext):
+    email = (m.text or "").strip()
+    if not valid_email(email):
+        await m.reply("⚠️ بريد غير صالح. حاول مرة أخرى.")
+        return
+    await state.update_data(email=email)
+    await state.set_state(ContactStates.waiting_phone)
+    await m.reply("📱 أرسل رقم هاتفك (مصري) بصيغة 01XXXXXXXXX أو +201XXXXXXXXX")
+
+@dp.message(StateFilter(ContactStates.waiting_phone))
+async def take_phone(m: Message, state: FSMContext):
+    phone = (m.text or "").strip()
+    if not valid_phone(phone):
+        await m.reply("⚠️ رقم غير صالح. أعد الإرسال بصيغة 01XXXXXXXXX أو +201XXXXXXXXX.")
+        return
+    data = await state.get_data()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET email=?, phone=? WHERE user_id=?", (data["email"], phone, m.from_user.id))
+        await db.commit()
+    await state.clear()
+    await m.reply("✅ تم حفظ بيانات التواصل بنجاح. يمكنك الآن استخدام /charge")
+
+@dp.message(Command("mycontact"))
+async def mycontact_cmd(m: Message):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT email, phone FROM users WHERE user_id=?", (m.from_user.id,))
+        row = await cur.fetchone()
+        if row:
+            email, phone = row
+            await m.reply(f"📇 بياناتك:
+Email: {email or '-'}
+Phone: {phone or '-'}")
+        else:
+            await m.reply("لا يوجد بيانات مسجلة لك. استخدم /setcontact")
+
+
 async def get_or_create_user(user_id: int) -> float:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
