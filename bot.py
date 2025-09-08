@@ -192,7 +192,8 @@ async def mycontact_cmd(m: Message):
         row = await cur.fetchone()
         if row:
             email, phone = row
-            await m.reply(f"📇 بياناتك:
+  await m.reply(f"بعتلي رقم موبايلك وإيميلك بالشكل ده:\n\nمثال:\n📧 example@email.com\n📱 01012345678")
+          await m.reply(f"📇 بياناتك:
 Email: {email or '-'}
 Phone: {phone or '-'}")
         else:
