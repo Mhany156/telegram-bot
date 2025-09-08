@@ -395,15 +395,6 @@ async def import_file_handler(m: Message):
         await m.reply(f"❌ فشل تنزيل الملف: {e}"); return
     await process_import(text, is_multi_mode=bool(w_m), message=m)
     dp.workflow_state = {}
-@dp.message()
-async def pasted_imports(m: Message):
-    st = getattr(dp, "workflow_state", {})
-    w_m = st.get("awaiting_importm"); w_s = st.get("awaiting_import")
-    if (w_m and w_m.get("admin") == m.from_user.id) or (w_s and w_s.get("admin") == m.from_user.id):
-        if is_admin(m.from_user.id):
-            await process_import(m.text or "", is_multi_mode=bool(w_m), message=m)
-            dp.workflow_state = {}
-            return
 
 # ==================== RUN ====================
 async def main():
