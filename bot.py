@@ -160,30 +160,30 @@ def valid_phone(s: str) -> bool:
 @dp.message(Command("setcontact"))
 async def setcontact_cmd(m: Message, state: FSMContext):
     await state.set_state(ContactStates.waiting_email)
-    await m.reply("âœ‰ï¸ Ù…Ù† ÙØ¶Ù„Ùƒ Ø£Ø±Ø³Ù„ Ø¨Ø±ÙŠØ¯Ùƒ Ø§Ù„Ø¥Ù„ÙƒØªØ±ÙˆÙ†ÙŠ (Ù…Ø«Ø§Ù„: {user_email})")
+    await m.reply("من فضلك أرسل بريدك الإلكتروني")
 
 @dp.message(StateFilter(ContactStates.waiting_email))
 async def take_email(m: Message, state: FSMContext):
     email = (m.text or "").strip()
     if not valid_email(email):
-        await m.reply("âš ï¸ Ø¨Ø±ÙŠØ¯ ØºÙŠØ± ØµØ§Ù„Ø­. Ø­Ø§ÙˆÙ„ Ù…Ø±Ø© Ø£Ø®Ø±Ù‰.")
+        await m.reply("صيغة البريد الإلكتروني غير صحيحة.")
         return
     await state.update_data(email=email)
     await state.set_state(ContactStates.waiting_phone)
-    await m.reply("ðŸ“± Ø£Ø±Ø³Ù„ Ø±Ù‚Ù… Ù‡Ø§ØªÙÙƒ (Ù…ØµØ±ÙŠ) Ø¨ØµÙŠØºØ© 01XXXXXXXXX Ø£Ùˆ +201XXXXXXXXX")
+    await m.reply("أرسل رقم هاتفك (مثال مصر): 01XXXXXXXXX أو +201XXXXXXXXX")
 
 @dp.message(StateFilter(ContactStates.waiting_phone))
 async def take_phone(m: Message, state: FSMContext):
     phone = (m.text or "").strip()
     if not valid_phone(phone):
-        await m.reply("âš ï¸ Ø±Ù‚Ù… ØºÙŠØ± ØµØ§Ù„Ø­. Ø£Ø¹Ø¯ Ø§Ù„Ø¥Ø±Ø³Ø§Ù„ Ø¨ØµÙŠØºØ© 01XXXXXXXXX Ø£Ùˆ +201XXXXXXXXX.")
+        await m.reply("رقم الهاتف غير صحيح. المثال: 01XXXXXXXXX أو +201XXXXXXXXX.")
         return
     data = await state.get_data()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE users SET email=?, phone=? WHERE user_id=?", (data["email"], phone, m.from_user.id))
         await db.commit()
     await state.clear()
-    await m.reply("âœ… ØªÙ… Ø­ÙØ¸ Ø¨ÙŠØ§Ù†Ø§Øª Ø§Ù„ØªÙˆØ§ØµÙ„ Ø¨Ù†Ø¬Ø§Ø­. ÙŠÙ…ÙƒÙ†Ùƒ Ø§Ù„Ø¢Ù† Ø§Ø³ØªØ®Ø¯Ø§Ù… /charge")
+    await m.reply("تم حفظ بيانات التواصل. الآن يمكنك استخدام /charge")
 
 @dp.message(Command("mycontact"))
 async def mycontact_cmd(m: Message):
@@ -194,7 +194,7 @@ async def mycontact_cmd(m: Message):
             email, phone = row
             await m.reply(f"Your saved contact info:\nEmail: {email or '-'}\nPhone: {phone or '-'}")
         else:
-            await m.reply("Ù„Ø§ ÙŠÙˆØ¬Ø¯ Ø¨ÙŠØ§Ù†Ø§Øª Ù…Ø³Ø¬Ù„Ø© Ù„Ùƒ. Ø§Ø³ØªØ®Ø¯Ù… /setcontact")
+            await m.reply("لا توجد بيانات اتصال محفوظة. استخدم /setcontact")
 
 
 async def get_or_create_user(user_id: int) -> float:
@@ -342,7 +342,7 @@ class ImportStates(StatesGroup):
 @dp.message(Command("start"))
 async def start_cmd(m: Message):
     await get_or_create_user(m.from_user.id)
-    await m.answer("Ø£Ù‡Ù„Ù‹Ø§ Ø¨Ùƒ ðŸ‘‹\nØ§Ø®ØªØ± Ù…Ù† Ø§Ù„Ù‚Ø§Ø¦Ù…Ø©:", reply_markup=main_menu_kb())
+    await m.answer("مرحبًا! اختر من القائمة:", reply_markup=main_menu_kb())
 
 @dp.message(Command("whoami"))
 async def whoami_cmd(m: Message):
@@ -351,33 +351,33 @@ async def whoami_cmd(m: Message):
 @dp.message(Command("balance"))
 async def balance_cmd(m: Message):
     bal = await get_or_create_user(m.from_user.id)
-    await m.answer(f"Ø±ØµÙŠØ¯Ùƒ Ø§Ù„Ø­Ø§Ù„ÙŠ: {bal:g} Ø¬.Ù…", reply_markup=main_menu_kb())
+    await m.answer(f"رصيدك الحالي: {bal:g} ج.م", reply_markup=main_menu_kb())
 
 @dp.callback_query(F.data == "balance")
 async def cb_balance(c: CallbackQuery):
     bal = await get_or_create_user(c.from_user.id)
-    await c.message.edit_text(f"Ø±ØµÙŠØ¯Ùƒ Ø§Ù„Ø­Ø§Ù„ÙŠ: {bal:g} Ø¬.Ù…", reply_markup=main_menu_kb())
+    await c.message.edit_text(f"رصيدك الحالي: {bal:g} ج.م", reply_markup=main_menu_kb())
 
 @dp.callback_query(F.data == "charge_menu")
 async def cb_charge_menu(c: CallbackQuery):
-    await c.message.edit_text("Ù„Ø´Ø­Ù† Ø±ØµÙŠØ¯ÙƒØŒ Ø§Ø³ØªØ®Ø¯Ù… Ø§Ù„Ø£Ù…Ø± Ø§Ù„ØªØ§Ù„ÙŠ:\n`/charge <amount>`\nÙ…Ø«Ø§Ù„: `/charge 100`.", parse_mode="Markdown")
+    await c.message.edit_text("لشحن الرصيد استخدم:\n`/charge <amount>`\nمثال: `/charge 100`.", parse_mode="Markdown")
 
 @dp.callback_query(F.data == "back_home")
 async def cb_back_home(c: CallbackQuery):
-    await c.message.edit_text("Ø§Ø®ØªØ± Ù…Ù† Ø§Ù„Ù‚Ø§Ø¦Ù…Ø©:", reply_markup=main_menu_kb())
+    await c.message.edit_text("اختر من القائمة:", reply_markup=main_menu_kb())
 
 # ==================== IMPORT COMMANDS ====================
 @dp.message(Command("importstock"))
 async def importstock_cmd(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
     await state.set_state(ImportStates.single)
-    await m.reply("ðŸ“¥ Ø£Ø±Ø³Ù„ TXT Ø£Ùˆ Ø§Ù„ØµÙ‚ Ø³Ø·ÙˆØ±:\n<category> <price> <credential>")
+    await m.reply("أرسل سطر TXT بالصورة:\n<category> <price> <credential>")
 
 @dp.message(Command("importstockm"))
 async def importstockm_cmd(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
     await state.set_state(ImportStates.multi)
-    await m.reply("ðŸ“¥ Ø£Ø±Ø³Ù„ TXT:\n<cat> <p_p> <p_c> <s_p> <s_c> <l_p> <l_c> <cred>")
+    await m.reply("أرسل ملف TXT:\n<cat> <p_p> <p_c> <s_p> <s_c> <l_p> <l_c> <cred>")
 
 def parse_stock_lines(text: str):
     ok, fail, res = 0, 0, []
@@ -425,7 +425,7 @@ async def import_text_single(m: Message, state: FSMContext):
     rows, ok, fail = parse_stock_lines(m.text or "")
     for cat, price, cred in rows:
         await add_stock_simple(cat, price, cred)
-    await m.reply(f"âœ… ØªÙ… Ø§Ø³ØªÙŠØ±Ø§Ø¯ {ok}. âŒ ÙØ´Ù„ {fail}.")
+    await m.reply(f"تمت إضافة {ok}. فشل {fail}.")
     await state.clear()
 
 @dp.message(StateFilter(ImportStates.multi), F.text)
@@ -434,7 +434,7 @@ async def import_text_multi(m: Message, state: FSMContext):
     rows, ok, fail = parse_stockm_lines(m.text or "")
     for cat, ppr, pcap, spr, scap, lpr, lcap, cred in rows:
         await add_stock_row_modes(cat, cred, ppr, pcap, spr, scap, lpr, lcap)
-    await m.reply(f"âœ… ØªÙ… Ø§Ø³ØªÙŠØ±Ø§Ø¯ {ok} (Ù…ÙˆØ¯Ø§Øª). âŒ ÙØ´Ù„ {fail}.")
+    await m.reply(f"تمت إضافة {ok} (بوضعيات متعددة). فشل {fail}.")
     await state.clear()
 
 @dp.message(StateFilter(ImportStates.single), F.document)
@@ -442,7 +442,7 @@ async def import_file_single(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
     doc: Document = m.document
     if not (doc.mime_type == "text/plain" or (doc.file_name and doc.file_name.lower().endswith(".txt"))):
-        await m.reply("âš ï¸ Ø£Ø±Ø³Ù„ Ù…Ù„Ù .txt ÙÙ‚Ø·."); return
+        await m.reply("من فضلك أرسل ملف .txt صالح."); return
     try:
         file = await bot.get_file(doc.file_id)
         from io import BytesIO
@@ -450,11 +450,11 @@ async def import_file_single(m: Message, state: FSMContext):
         await bot.download(file, buf)
         text = buf.getvalue().decode("utf-8", "ignore")
     except Exception as e:
-        await m.reply(f"âŒ ÙØ´Ù„ ØªÙ†Ø²ÙŠÙ„ Ø§Ù„Ù…Ù„Ù: {e}"); return
+        await m.reply(f"حدث خطأ أثناء القراءة: {e}"); return
     rows, ok, fail = parse_stock_lines(text)
     for cat, price, cred in rows:
         await add_stock_simple(cat, price, cred)
-    await m.reply(f"âœ… ØªÙ… Ø§Ø³ØªÙŠØ±Ø§Ø¯ {ok}. âŒ ÙØ´Ù„ {fail}.")
+    await m.reply(f"تمت إضافة {ok}. فشل {fail}.")
     await state.clear()
 
 @dp.message(StateFilter(ImportStates.multi), F.document)
@@ -462,7 +462,7 @@ async def import_file_multi(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
     doc: Document = m.document
     if not (doc.mime_type == "text/plain" or (doc.file_name and doc.file_name.lower().endswith(".txt"))):
-        await m.reply("âš ï¸ Ø£Ø±Ø³Ù„ Ù…Ù„Ù .txt ÙÙ‚Ø·."); return
+        await m.reply("من فضلك أرسل ملف .txt صالح."); return
     try:
         file = await bot.get_file(doc.file_id)
         from io import BytesIO
@@ -470,11 +470,11 @@ async def import_file_multi(m: Message, state: FSMContext):
         await bot.download(file, buf)
         text = buf.getvalue().decode("utf-8", "ignore")
     except Exception as e:
-        await m.reply(f"âŒ ÙØ´Ù„ ØªÙ†Ø²ÙŠÙ„ Ø§Ù„Ù…Ù„Ù: {e}"); return
+        await m.reply(f"حدث خطأ أثناء القراءة: {e}"); return
     rows, ok, fail = parse_stockm_lines(text)
     for cat, ppr, pcap, spr, scap, lpr, lcap, cred in rows:
         await add_stock_row_modes(cat, cred, ppr, pcap, spr, scap, lpr, lcap)
-    await m.reply(f"âœ… ØªÙ… Ø§Ø³ØªÙŠØ±Ø§Ø¯ {ok} (Ù…ÙˆØ¯Ø§Øª). âŒ ÙØ´Ù„ {fail}.")
+    await m.reply(f"تمت إضافة {ok} (بوضعيات متعددة). فشل {fail}.")
     await state.clear()
 
 # ==================== PAYMOB INTEGRATION ====================
@@ -524,14 +524,14 @@ async def get_payment_key(token: str, order_id: int, amount_cents: int, integrat
 @dp.message(Command("charge"))
 async def charge_cmd(m: Message, command: CommandObject):
     if not command.args:
-        await m.reply("âš ï¸ Ø§Ù„Ø§Ø³ØªØ®Ø¯Ø§Ù…: /charge <amount>\nÙ…Ø«Ø§Ù„: /charge 50"); return
+        await m.reply("من فضلك استخدم: /charge <amount>\nمثال: /charge 50"); return
     amount_egp = parse_float_loose(command.args)
     if amount_egp is None or amount_egp <= 1:
-        await m.reply("âš ï¸ Ø§Ù„Ù…Ø¨Ù„Øº ÙŠØ¬Ø¨ Ø£Ù† ÙŠÙƒÙˆÙ† Ø±Ù‚Ù…Ù‹Ø§ ØµØ­ÙŠØ­Ù‹Ø§ ÙˆØ£ÙƒØ¨Ø± Ù…Ù† 1."); return
+        await m.reply("المبلغ غير صالح. يجب أن يكون أكبر من 1."); return
     amount_cents = int(amount_egp * 100)
 
     if not (PAYMOB_API_KEY and PAYMOB_CARD_ID > 0 and PAYMOB_IFRAME_ID > 0):
-        await m.reply("âš ï¸ Ø¥Ø¹Ø¯Ø§Ø¯Ø§Øª Ø§Ù„Ø¯ÙØ¹ ØºÙŠØ± Ù…ÙƒØªÙ…Ù„Ø©. Ø±Ø§Ø¬Ø¹ .env"); return
+        await m.reply("إعدادات الدفع غير مكتملة (.env)."); return
 
     merchant_order_id = f"tg-{m.from_user.id}-{int(time.time())}"
 
@@ -568,57 +568,51 @@ async def charge_cmd(m: Message, command: CommandObject):
             await db.commit()
 
         kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text=f"ðŸ’³ Ø§Ø¯ÙØ¹ {amount_egp:g} Ø¬Ù†ÙŠÙ‡ Ø§Ù„Ø¢Ù†", url=payment_url)
+            InlineKeyboardButton(text=f"ادفع {amount_egp:g} ج.م", url=payment_url)
         ]])
-        await m.reply("ØªÙ… Ø¥Ù†Ø´Ø§Ø¡ ÙØ§ØªÙˆØ±Ø© Ø§Ù„Ø¯ÙØ¹. Ø§Ø¶ØºØ· Ø¹Ù„Ù‰ Ø§Ù„Ø²Ø± Ø£Ø¯Ù†Ø§Ù‡ Ù„Ø¥ØªÙ…Ø§Ù… Ø§Ù„Ø¹Ù…Ù„ÙŠØ©.", reply_markup=kb)
+        await m.reply("تم إنشاء طلب الدفع. اضغط الزر لإتمام العملية. إذا لم يفتح الرابط، انسخه وافتحه يدويًا.", reply_markup=kb)
 
     except Exception as e:
         print("[PAYMOB ERROR]", e)
-        await m.reply("Ø­Ø¯Ø« Ø®Ø·Ø£ Ø£Ø«Ù†Ø§Ø¡ Ø¥Ù†Ø´Ø§Ø¡ ÙØ§ØªÙˆØ±Ø© Ø§Ù„Ø¯ÙØ¹. Ø¬Ø±Ù‘Ø¨ Ù…Ø±Ø© Ø£Ø®Ø±Ù‰ Ù„Ø§Ø­Ù‚Ù‹Ø§.")
+        await m.reply("حدث خطأ أثناء إنشاء عملية الدفع. حاول لاحقًا.")
 
 # ==================== CATALOG & BUY (Atomic) ====================
 @dp.callback_query(F.data == "catalog")
 async def cb_catalog(c: CallbackQuery):
     rows = await list_categories()
     if not rows:
-        await c.message.edit_text("Ù„Ø§ ØªÙˆØ¬Ø¯ Ù…Ø®Ø²ÙˆÙ†Ø§Øª Ø­Ø§Ù„ÙŠÙ‹Ø§.", reply_markup=main_menu_kb()); return
-    kb = [[InlineKeyboardButton(text=f"{cat} â€” {cnt} Ø¹Ù†ØµØ±", callback_data=f"cat::{cat}")] for cat, cnt in rows]
-    kb.append([InlineKeyboardButton(text="ðŸ”™ Ø±Ø¬ÙˆØ¹", callback_data="back_home")])
-    await c.message.edit_text("ðŸ›ï¸ Ø§Ø®ØªØ± ÙØ¦Ø©:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+        await c.message.edit_text("لا توجد فئات متاحة.", reply_markup=main_menu_kb()); return
+    kb = [[InlineKeyboardButton(text=f"{cat} — {cnt} عنصر", callback_data=f"cat::{cat}")] for cat, cnt in rows]
+    kb.append([InlineKeyboardButton(text="رجوع", callback_data="back_home")])
+    await c.message.edit_text("اختر فئة:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 def modes_kb(modes_info, category):
-    name = {"personal":"ÙØ±Ø¯ÙŠ","shared":"Ù…Ø´ØªØ±Ùƒ","laptop":"Ù„Ø§Ø¨ØªÙˆØ¨"}
+    name = {"personal":"شخصي","shared":"مشترك","laptop":"لابتوب"}
     rows = []
     for m in ["personal","shared","laptop"]:
         if m in modes_info:
             mi = modes_info[m]
             rows.append([InlineKeyboardButton(
-                text=f"{name[m]} â€” Ù…Ù† {mi['min_price']:g} Ø¬.Ù… ({mi['count']} Ø¹Ù†ØµØ±)",
+                text=f"{name[m]} — من {mi['min_price']:g} ج.م ({mi['count']} متاح)",
                 callback_data=f"mode::{category}::{m}"
             )])
-    rows.append([InlineKeyboardButton(text="ðŸ”™ Ø±Ø¬ÙˆØ¹", callback_data="catalog")])
+    rows.append([InlineKeyboardButton(text="رجوع", callback_data="catalog")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 @dp.callback_query(F.data.startswith("cat::"))
 async def cb_pick_category(c: CallbackQuery):
     category = c.data.split("::",1)[1]
     modes_info = await list_modes_for_category(category)
-    if not modes_info: await c.answer("Ù„Ø§ ÙŠÙˆØ¬Ø¯ Ø¹Ù†Ø§ØµØ± Ù…ØªØ§Ø­Ø© ÙÙŠ Ù‡Ø°Ù‡ Ø§Ù„ÙØ¦Ø© Ø­Ø§Ù„ÙŠÙ‹Ø§.", show_alert=True); return
-    await c.message.edit_text(f"Ø§Ù„ÙØ¦Ø©: {category}\nØ§Ø®ØªØ± Ø§Ù„Ù†ÙˆØ¹:", reply_markup=modes_kb(modes_info, category))
+    if not modes_info: await c.answer("لا يوجد مخزون متاح لهذه الفئة.", show_alert=True); return
+    await c.message.edit_text(f"الفئة: {category}\nاختر الوضع:", reply_markup=modes_kb(modes_info, category))
 
 @dp.callback_query(F.data.startswith("mode::"))
 async def cb_pick_mode(c: CallbackQuery):
     _, category, mode = c.data.split("::",2)
     item = await find_item_with_mode(category, mode)
-    if not item: await c.answer("Ù„Ø§ ÙŠÙˆØ¬Ø¯ Ø¹Ù†ØµØ± Ù…Ù†Ø§Ø³Ø¨ Ø§Ù„Ø¢Ù†.", show_alert=True); return
+    if not item: await c.answer("لا توجد عناصر متاحة حاليًا.", show_alert=True); return
     price = price_for_mode(item, mode)
-    await c.message.edit_text(
-        f"Ø§Ù„ÙØ¦Ø©: {category}\nØ§Ù„Ù†ÙˆØ¹: {mode}\nØ§Ù„Ø³Ø¹Ø±: {price:g} Ø¬.Ù…\nØ§Ø¶ØºØ· Ø´Ø±Ø§Ø¡ Ù„Ø¥ØªÙ…Ø§Ù… Ø§Ù„Ø¹Ù…Ù„ÙŠØ©.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="âœ… Ø´Ø±Ø§Ø¡ Ø§Ù„Ø¢Ù†", callback_data=f"buy::{category}::{mode}")],
-            [InlineKeyboardButton(text="ðŸ”™ Ø±Ø¬ÙˆØ¹", callback_data=f"cat::{category}")]
-        ])
-    )
+    await c.message.edit_text(f"الفئة: {category}\nالوضع: {mode}\nالسعر: {price:g} ج.م\nاضغط شراء للمتابعة.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="شراء الآن", callback_data=f"buy::{category}::{mode}")],[InlineKeyboardButton(text="رجوع", callback_data=f"cat::{category}")]]))
 
 async def atomic_buy(user_id: int, category: str, mode: str):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -714,17 +708,17 @@ async def cb_buy(c: CallbackQuery):
             bal = await get_or_create_user(c.from_user.id)
             item = await find_item_with_mode(category, mode)
             price = price_for_mode(item, mode) if item else 0
-            await c.answer(f"Ø±ØµÙŠØ¯Ùƒ Ù„Ø§ ÙŠÙƒÙÙŠ. Ø§Ù„Ø³Ø¹Ø± {price:g} Ø¬.Ù… ÙˆØ±ØµÙŠØ¯Ùƒ {bal:g} Ø¬.Ù…", show_alert=True)
+            await c.answer(f"رصيدك غير كافٍ. السعر {price:g} ج.م، رصيدك {bal:g} ج.م.", show_alert=True)
         elif code in ("NO_ITEM","NO_STOCK"):
-            await c.answer("Ù„Ø§ ÙŠÙˆØ¬Ø¯ Ø¹Ù†ØµØ± Ù…ØªØ§Ø­ Ø§Ù„Ø¢Ù†.", show_alert=True)
+            await c.answer("لا يوجد مخزون متاح حاليًا.", show_alert=True)
         else:
-            await c.answer("Ø­Ø¯Ø« ØªØ¹Ø§Ø±Ø¶ Ø£Ø«Ù†Ø§Ø¡ Ø§Ù„Ø´Ø±Ø§Ø¡. Ø¬Ø±Ù‘Ø¨ Ù…Ø±Ø© Ø£Ø®Ø±Ù‰.", show_alert=True)
+            await c.answer("حدث خطأ غير متوقع أثناء الشراء. حاول لاحقًا.", show_alert=True)
         return
 
     row = res["row"]; price = res["price"]
     credential = escape(row[3])
     instructions = await get_instruction(category, mode)
-    message_text = f"ðŸ“© <b>Ø¨ÙŠØ§Ù†Ø§Øª Ø­Ø³Ø§Ø¨Ùƒ:</b>\n<code>{credential}</code>"
+    message_text = f"📩 <b>بيانات الحساب المشتراة:</b>\n<code>{credential}</code>"
     if instructions:
         message_text += f"\n\n<pre>{escape(instructions)}</pre>"
     try:
@@ -732,7 +726,7 @@ async def cb_buy(c: CallbackQuery):
     except Exception:
         pass
 
-    await c.message.edit_text(f"âœ… ØªÙ… Ø§Ù„Ø´Ø±Ø§Ø¡: {category}\nØ§Ù„Ù†ÙˆØ¹: {mode}\nØ§Ù„Ø³Ø¹Ø±: {price:g} Ø¬.Ù…\n\nØªÙ… Ø¥Ø±Ø³Ø§Ù„ Ø§Ù„Ø¨ÙŠØ§Ù†Ø§Øª ÙˆØ§Ù„ØªØ¹Ù„ÙŠÙ…Ø§Øª ÙÙŠ Ø±Ø³Ø§Ù„Ø© Ø®Ø§ØµØ©.")
+    await c.message.edit_text(f"تمت عملية الشراء بنجاح:\nالفئة: {category}\nالوضع: {mode}\nالسعر: {price:g} ج.م\n\nتم إرسال التفاصيل إلى الخاص. يرجى عدم مشاركة بياناتك.")
 
 # ==================== INSTRUCTIONS ADMIN ====================
 async def set_instruction(category: str, mode: str, message: str):
@@ -766,13 +760,13 @@ async def setinstructions_cmd(m: Message):
     parts = (m.text or "").split(maxsplit=3)
     valid_modes = ["personal", "shared", "laptop"]
     if len(parts) < 4:
-        await m.reply(f"âš ï¸ Ø§Ù„Ø§Ø³ØªØ®Ø¯Ø§Ù…: /setinstructions <category> <mode> <message>\nØ§Ù„Ø£Ù†Ù…Ø§Ø·: {', '.join(valid_modes)}")
+        await m.reply(f"من فضلك استخدم: /setinstructions <category> <mode> <message>\nالأوضاع المتاحة: {', '.join(valid_modes)}")
         return
     category, mode, message = parts[1], parts[2].lower(), parts[3]
     if mode not in valid_modes:
-        await m.reply(f"âš ï¸ Ù†Ù…Ø· ØºÙŠØ± ØµØ­ÙŠØ­. Ø§Ù„Ø£Ù†Ù…Ø§Ø·: {', '.join(valid_modes)}"); return
+        await m.reply(f"وضع غير صحيح. الأوضاع المتاحة: {', '.join(valid_modes)}"); return
     await set_instruction(category, mode, message)
-    await m.reply(f"âœ… ØªÙ… Ø­ÙØ¸ Ø§Ù„ØªØ¹Ù„ÙŠÙ…Ø§Øª Ù„Ù€: {category} ({mode})")
+    await m.reply(f"تم حفظ التعليمات للفئة: {category} ({mode})")
 
 @dp.message(Command("viewinstructions"))
 async def viewinstructions_cmd(m: Message, command: CommandObject):
@@ -783,12 +777,12 @@ async def viewinstructions_cmd(m: Message, command: CommandObject):
         if len(parts) == 2:
             mode = parts[1].lower()
             msg = await get_instruction(category, mode)
-            if not msg: await m.reply("Ù„Ø§ ØªÙˆØ¬Ø¯ ØªØ¹Ù„ÙŠÙ…Ø§Øª."); return
-            await m.reply(f"<b>ØªØ¹Ù„ÙŠÙ…Ø§Øª: {escape(category)} ({escape(mode)})</b>\n\n<pre>{escape(msg)}</pre>", parse_mode="HTML")
+            if not msg: await m.reply("لا توجد تعليمات."); return
+            await m.reply(f"<b>تعليمات: {escape(category)} ({escape(mode)})</b>\n\n<pre>{escape(msg)}</pre>", parse_mode="HTML")
             return
     all_inst = await get_all_instructions()
-    if not all_inst: await m.reply("Ù„Ø§ ØªÙˆØ¬Ø¯ Ø£ÙŠ ØªØ¹Ù„ÙŠÙ…Ø§Øª Ù…Ø­ÙÙˆØ¸Ø©."); return
-    lines = ["ðŸ“œ <b>Ø¬Ù…ÙŠØ¹ Ø§Ù„ØªØ¹Ù„ÙŠÙ…Ø§Øª</b>"]
+    if not all_inst: await m.reply("لا توجد تعليمات محفوظة."); return
+    lines = ["📋 <b>جميع التعليمات</b>"]
     for cat, md, text in all_inst:
         lines.append(f"\n--- <b>{escape(cat)} ({escape(md)})</b> ---\n<pre>{escape(text)}</pre>")
     await m.reply("\n".join(lines), parse_mode="HTML")
@@ -848,7 +842,7 @@ async def mark_payment_paid(merchant_order_id: str) -> bool:
     amount = (amount_cents or 0) / 100.0
     await change_balance(user_id, amount)
     try:
-        await bot.send_message(user_id, f"âœ… ØªÙ… Ø´Ø­Ù† Ø±ØµÙŠØ¯Ùƒ Ø¨Ù…Ø¨Ù„Øº {amount:g} Ø¬.Ù….")
+        await bot.send_message(user_id, f"تم شحن رصيدك بمبلغ {amount:g} ج.م.")
     except Exception:
         pass
     return True
@@ -897,9 +891,9 @@ async def confirm_cmd(m: Message, command: CommandObject):
     if not is_admin(m.from_user.id): return
     merchant_order_id = (command.args or "").strip()
     if not merchant_order_id:
-        await m.reply("Ø§Ù„Ø§Ø³ØªØ®Ø¯Ø§Ù…: /confirmcharge <merchant_order_id>"); return
+        await m.reply("من فضلك استخدم: /confirmcharge <merchant_order_id>"); return
     ok = await mark_payment_paid(merchant_order_id)
-    await m.reply("âœ… ØªÙ… Ø§Ù„ØªØ£ÙƒÙŠØ¯ ÙˆØ´Ø­Ù† Ø§Ù„Ø±ØµÙŠØ¯." if ok else "âŒ Ù„Ù… ÙŠØªÙ… Ø§Ù„Ø¹Ø«ÙˆØ± Ø¹Ù„Ù‰ Ø§Ù„Ø¹Ù…Ù„ÙŠØ©.")
+    await m.reply("تم تأكيد الدفع وتحديث الرصيد." if ok else "تعذر العثور على العملية أو لم تتم.")
 
 # ==================== RUN ====================
 async def run_web_app():
