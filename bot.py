@@ -1,18 +1,26 @@
+
 import os
 import asyncio
 import re
 import json
 import time
+import contextlib
 from html import escape
+import hmac
+import hashlib
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command, CommandObject
+from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Document
 )
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+
 import aiohttp
 import aiosqlite
+from aiohttp import web
 
 # ==================== CONFIG ====================
 load_dotenv()
@@ -20,12 +28,17 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
-# --- تحميل متغيرات Paymob ---
+# --- Paymob variables ---
 PAYMOB_API_KEY = os.getenv("PAYMOB_API_KEY")
 PAYMOB_CARD_ID = int(os.getenv("PAYMOB_CARD_INTEGRATION_ID", 0))
 PAYMOB_WALLET_ID = int(os.getenv("PAYMOB_WALLET_INTEGRATION_ID", 0))
-PAYMOB_IFRAME_ID = int(os.getenv("PAYMOB_IFRAME_ID", 0)) # إضافة متغير للـ iFrame ID
+PAYMOB_IFRAME_ID = int(os.getenv("PAYMOB_IFRAME_ID", 0))
+PAYMOB_HMAC_SECRET = os.getenv("PAYMOB_HMAC_SECRET", "")  # Optional: used to verify callbacks
 
+# --- Web server (for webhook) ---
+WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0")
+WEB_PORT = int(os.getenv("WEB_PORT", "8080"))
+WEB_BASE_PATH = os.getenv("WEB_BASE_PATH", "").rstrip("/")  # e.g., "/api" -> webhook at /api/paymob/webhook
 
 if not TOKEN:
     raise RuntimeError("Please set TELEGRAM_TOKEN in .env")
@@ -71,6 +84,18 @@ async def init_db():
             message_text TEXT NOT NULL,
             PRIMARY KEY (category, mode)
         );""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS payments(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            merchant_order_id TEXT UNIQUE,
+            user_id INTEGER,
+            amount_cents INTEGER,
+            status TEXT,  -- pending/paid/failed
+            created_at TEXT DEFAULT (DATETIME('now','localtime'))
+        );""")
+
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_stock_category ON stock(category);")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_sales_user ON sales_history(user_id);")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_payments_order ON payments(merchant_order_id);")
         await db.commit()
     await migrate_db()
 
@@ -322,6 +347,11 @@ async def get_all_instructions():
         cur = await db.execute("SELECT category, mode, message_text FROM instructions ORDER BY category, mode")
         return await cur.fetchall()
 
+# ==================== FSM لحالات الاستيراد ====================
+class ImportStates(StatesGroup):
+    single = State()
+    multi  = State()
+
 # ==================== USER HANDLERS ====================
 @dp.message(Command("start"))
 async def start_cmd(m: Message):
@@ -351,7 +381,7 @@ async def cb_back_home(c: CallbackQuery):
     await c.message.edit_text("اختر من القائمة:", reply_markup=main_menu_kb())
 
 # ==================== ADMIN: BALANCE ====================
-@dp.message(Command("addbal"))
+@dp.message(Command("addbal"))  # /addbal <user_id> <amount>
 async def addbal_cmd(m: Message, command: CommandObject):
     if not is_admin(m.from_user.id): return
     if not command.args:
@@ -448,35 +478,35 @@ async def viewinstructions_cmd(m: Message, command: CommandObject):
             mode = parts[1].lower()
             msg = await get_instruction(category, mode)
             if not msg: await m.reply("لا توجد تعليمات لهذه الفئة والنمط."); return
-            await m.reply(f"<b>تعليمات: {escape(category)} ({escape(mode)})</b>\n\n{msg}", parse_mode="HTML")
+            await m.reply(f"<b>تعليمات: {escape(category)} ({escape(mode)})</b>\n\n<pre>{escape(msg)}</pre>", parse_mode="HTML")
         else:
             all_inst = await get_all_instructions()
             cat_inst = [i for i in all_inst if i[0] == category]
             if not cat_inst: await m.reply("لا توجد تعليمات لهذه الفئة."); return
             lines = [f"📜 <b>تعليمات فئة: {escape(category)}</b>"]
             for cat, md, text in cat_inst:
-                lines.append(f"\n--- <b>{escape(md)}</b> ---\n{text}")
+                lines.append(f"\n--- <b>{escape(md)}</b> ---\n<pre>{escape(text)}</pre>")
             await m.reply("\n".join(lines), parse_mode="HTML")
     else:
         all_inst = await get_all_instructions()
         if not all_inst: await m.reply("لا توجد أي تعليمات محفوظة."); return
         lines = ["📜 <b>جميع التعليمات المحفوظة:</b>"]
         for cat, md, text in all_inst:
-            lines.append(f"\n--- <b>{escape(cat)} ({escape(md)})</b> ---\n{text}")
+            lines.append(f"\n--- <b>{escape(cat)} ({escape(md)})</b> ---\n<pre>{escape(text)}</pre>")
         await m.reply("\n".join(lines), parse_mode="HTML")
 
-# ==================== IMPORT LOGIC ====================
+# ==================== IMPORT LOGIC (FSM) ====================
 @dp.message(Command("importstock"))
-async def importstock_cmd(m: Message):
+async def importstock_cmd(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
+    await state.set_state(ImportStates.single)
     await m.reply("📥 أرسل ملف TXT أو الصق سطور بصيغة:\n<category> <price> <credential>")
-    dp.workflow_state = {"awaiting_import": {"admin": m.from_user.id}}
 
 @dp.message(Command("importstockm"))
-async def importstockm_cmd(m: Message):
+async def importstockm_cmd(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
+    await state.set_state(ImportStates.multi)
     await m.reply("📥 أرسل TXT أو الصق سطور بصيغة:\n<cat> <p_p> <p_c> <s_p> <s_c> <l_p> <l_c> <cred>")
-    dp.workflow_state = {"awaiting_importm": {"admin": m.from_user.id}}
 
 def parse_stock_lines(text: str):
     ok, fail, res = 0, 0, []
@@ -505,7 +535,7 @@ def parse_stockm_lines(text: str):
         if any(v is None for v in [p_price,p_cap,s_price,s_cap,l_price,l_cap]): fail += 1; continue
         results.append((cat, p_price, p_cap, s_price, s_cap, l_price, l_cap, cred)); ok += 1
     return results, ok, fail
-    
+
 async def process_import(text: str, is_multi_mode: bool, message: Message):
     if is_multi_mode:
         rows, ok, fail = parse_stockm_lines(text)
@@ -518,13 +548,9 @@ async def process_import(text: str, is_multi_mode: bool, message: Message):
             await add_stock_simple(cat, price, cred)
         await message.reply(f"✅ تم استيراد {ok}. ❌ فشل {fail}.")
 
-@dp.message(F.document)
-async def import_file_handler(m: Message):
-    st = getattr(dp, "workflow_state", {})
-    w_m = st.get("awaiting_importm"); w_s = st.get("awaiting_import")
-    if not (w_m or w_s) or not is_admin(m.from_user.id): return
-    if (w_m and w_m.get("admin") != m.from_user.id) or \
-       (w_s and w_s.get("admin") != m.from_user.id): return
+@dp.message(StateFilter(ImportStates.single), F.document)
+async def import_file_single(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id): return
     doc: Document = m.document
     if not (doc.mime_type == "text/plain" or (doc.file_name and doc.file_name.lower().endswith(".txt"))):
         await m.reply("⚠️ أرسل ملف .txt فقط."); return
@@ -536,23 +562,51 @@ async def import_file_handler(m: Message):
         text = buf.getvalue().decode("utf-8", "ignore")
     except Exception as e:
         await m.reply(f"❌ فشل تنزيل الملف: {e}"); return
-    await process_import(text, is_multi_mode=bool(w_m), message=m)
-    dp.workflow_state = {}
+    await process_import(text, is_multi_mode=False, message=m)
+    await state.clear()
+
+@dp.message(StateFilter(ImportStates.multi), F.document)
+async def import_file_multi(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id): return
+    doc: Document = m.document
+    if not (doc.mime_type == "text/plain" or (doc.file_name and doc.file_name.lower().endswith(".txt"))):
+        await m.reply("⚠️ أرسل ملف .txt فقط."); return
+    try:
+        file = await bot.get_file(doc.file_id)
+        from io import BytesIO
+        buf = BytesIO()
+        await bot.download(file, buf)
+        text = buf.getvalue().decode("utf-8", "ignore")
+    except Exception as e:
+        await m.reply(f"❌ فشل تنزيل الملف: {e}"); return
+    await process_import(text, is_multi_mode=True, message=m)
+    await state.clear()
+
+@dp.message(StateFilter(ImportStates.single), F.text)
+async def import_text_single(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id): return
+    await process_import(m.text or "", is_multi_mode=False, message=m)
+    await state.clear()
+
+@dp.message(StateFilter(ImportStates.multi), F.text)
+async def import_text_multi(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id): return
+    await process_import(m.text or "", is_multi_mode=True, message=m)
+    await state.clear()
 
 # ==================== PAYMOB INTEGRATION ====================
 PAYMOB_AUTH_URL = "https://accept.paymob.com/api/auth/tokens"
 PAYMOB_ORDER_URL = "https://accept.paymob.com/api/ecommerce/orders"
 PAYMOB_PAYMENT_KEY_URL = "https://accept.paymob.com/api/acceptance/payment_keys"
 PAYMOB_IFRAME_URL = f"https://accept.paymob.com/api/acceptance/iframes/{PAYMOB_IFRAME_ID}?payment_token={{}}"
+
 async def get_auth_token():
-    """الخطوة الأولى: الحصول على توكن المصادقة"""
     async with aiohttp.ClientSession() as session:
         async with session.post(PAYMOB_AUTH_URL, json={"api_key": PAYMOB_API_KEY}) as response:
             data = await response.json()
-            return data.get("token")
+            return data.get("token"), data
 
 async def register_order(token: str, merchant_order_id: str, amount_cents: int):
-    """الخطوة الثانية: تسجيل الطلب"""
     payload = {
         "auth_token": token, "delivery_needed": "false", "amount_cents": str(amount_cents),
         "currency": "EGP", "merchant_order_id": merchant_order_id,
@@ -560,10 +614,9 @@ async def register_order(token: str, merchant_order_id: str, amount_cents: int):
     async with aiohttp.ClientSession() as session:
         async with session.post(PAYMOB_ORDER_URL, json=payload) as response:
             data = await response.json()
-            return data.get("id")
+            return data.get("id"), data
 
 async def get_payment_key(token: str, order_id: int, amount_cents: int, integration_id: int, user_details: dict):
-    """الخطوة الثالثة: الحصول على مفتاح الدفع النهائي"""
     payload = {
         "auth_token": token, "amount_cents": str(amount_cents), "expiration": 3600, "order_id": order_id,
         "billing_data": {
@@ -577,7 +630,7 @@ async def get_payment_key(token: str, order_id: int, amount_cents: int, integrat
     async with aiohttp.ClientSession() as session:
         async with session.post(PAYMOB_PAYMENT_KEY_URL, json=payload) as response:
             data = await response.json()
-            return data.get("token")
+            return data.get("token"), data
 
 @dp.message(Command("charge"))
 async def charge_cmd(m: Message, command: CommandObject):
@@ -587,29 +640,45 @@ async def charge_cmd(m: Message, command: CommandObject):
     if amount_egp is None or amount_egp <= 1:
         await m.reply("⚠️ المبلغ يجب أن يكون رقمًا صحيحًا وأكبر من 1."); return
     amount_cents = int(amount_egp * 100)
+
+    if not (PAYMOB_API_KEY and PAYMOB_CARD_ID > 0 and PAYMOB_IFRAME_ID > 0):
+        await m.reply("⚠️ إعدادات الدفع غير مكتملة. راجع ملف .env (API_KEY, CARD_INTEGRATION_ID, IFRAME_ID).")
+        return
+
     merchant_order_id = f"tg-{m.from_user.id}-{int(time.time())}"
-    
+
     try:
-        token = await get_auth_token()
-        if not token: raise Exception("Failed to get auth token")
-        order_id = await register_order(token, merchant_order_id, amount_cents)
-        if not order_id: raise Exception("Failed to register order")
-        
-        payment_key = await get_payment_key(
+        token, auth_raw = await get_auth_token()
+        if not token:
+            raise Exception(f"Failed to get auth token: {auth_raw}")
+        order_id, order_raw = await register_order(token, merchant_order_id, amount_cents)
+        if not order_id:
+            raise Exception(f"Failed to register order: {order_raw}")
+        payment_key, key_raw = await get_payment_key(
             token=token, order_id=order_id, amount_cents=amount_cents,
             integration_id=PAYMOB_CARD_ID,
             user_details={
                 "email": f"{m.from_user.id}@telegram.bot", "first_name": m.from_user.first_name or "Telegram",
-                "last_name": m.from_user.last_name or "User", "phone_number": f"+201000000000"
+                "last_name": m.from_user.last_name or "User", "phone_number": "+201000000000"
             }
         )
-        if not payment_key: raise Exception("Failed to get payment key")
-        
+        if not payment_key:
+            raise Exception(f"Failed to get payment key: {key_raw}")
+
         payment_url = PAYMOB_IFRAME_URL.format(payment_key)
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"💳 ادفع {amount_egp:g} جنيه الآن", url=payment_url)]
-        ])
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT INTO payments(merchant_order_id, user_id, amount_cents, status)
+                VALUES (?, ?, ?, 'pending')
+            """, (merchant_order_id, m.from_user.id, amount_cents))
+            await db.commit()
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text=f"💳 ادفع {amount_egp:g} جنيه الآن", url=payment_url)
+        ]])
         await m.reply("تم إنشاء فاتورة الدفع. اضغط على الزر أدناه لإتمام العملية.", reply_markup=kb)
+
     except Exception as e:
         print("[PAYMOB ERROR]", e)
         await m.reply("حدث خطأ أثناء إنشاء فاتورة الدفع. يرجى المحاولة مرة أخرى لاحقًا.")
@@ -618,7 +687,8 @@ async def charge_cmd(m: Message, command: CommandObject):
 @dp.callback_query(F.data == "catalog")
 async def cb_catalog(c: CallbackQuery):
     rows = await list_categories()
-    if not rows: await c.message.edit_text("لا توجد مخزونات حاليًا.", reply_markup=main_menu_kb()); return
+    if not rows:
+        await c.message.edit_text("لا توجد مخزونات حاليًا.", reply_markup=main_menu_kb()); return
     kb = [[InlineKeyboardButton(text=f"{cat} — {cnt} عنصر", callback_data=f"cat::{cat}")] for cat, cnt in rows]
     kb.append([InlineKeyboardButton(text="🔙 رجوع", callback_data="back_home")])
     await c.message.edit_text("🛍️ اختر فئة:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
@@ -657,35 +727,256 @@ async def cb_pick_mode(c: CallbackQuery):
         ])
     )
 
+# ===== الشراء الذرّي (Atomic) =====
+async def atomic_buy(user_id: int, category: str, mode: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA foreign_keys=ON")
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            cur = await db.execute("""
+                SELECT id, category, price, credential, IFNULL(is_sold,0),
+                       p_price, p_cap, IFNULL(p_sold,0),
+                       s_price, s_cap, IFNULL(s_sold,0),
+                       l_price, l_cap, IFNULL(l_sold,0),
+                       chosen_mode
+                FROM stock
+                WHERE category=? AND IFNULL(is_sold,0)=0
+                ORDER BY id ASC
+            """, (category,))
+            items = await cur.fetchall()
+            if not items:
+                raise ValueError("NO_ITEM")
+
+            def remaining_for_mode_row(row, m):
+                idx = {"personal": (6,7), "shared": (9,10), "laptop": (12,13)}[m]
+                cap = row[idx[0]] or 0
+                sold = row[idx[1]] or 0
+                return max(cap - sold, 0)
+
+            def price_for_mode_row(row, m):
+                col = {"personal":5, "shared":8, "laptop":11}[m]
+                return (row[col] if row[col] is not None else row[2]) or 0.0
+
+            chosen = None
+            for r in items:
+                ch = r[14]
+                if remaining_for_mode_row(r, mode) > 0 and (ch is None or ch == mode):
+                    chosen = r
+                    break
+            if not chosen:
+                raise ValueError("NO_STOCK")
+
+            price = float(price_for_mode_row(chosen, mode))
+
+            cur = await db.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+            row = await cur.fetchone()
+            bal = float(row[0] if row else 0.0)
+            if bal < price:
+                raise ValueError("LOW_BAL")
+
+            await db.execute(
+                "UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?",
+                (price, user_id, price)
+            )
+            if db.total_changes == 0:
+                raise ValueError("LOW_BAL")
+
+            sid = chosen[0]
+            sold_field, cap_field = {
+                "personal": ("p_sold","p_cap"),
+                "shared":   ("s_sold","s_cap"),
+                "laptop":   ("l_sold","l_cap"),
+            }[mode]
+            await db.execute(f"""
+                UPDATE stock
+                   SET {sold_field} = IFNULL({sold_field},0)+1,
+                       chosen_mode = COALESCE(chosen_mode, ?),
+                       is_sold = CASE WHEN (SELECT {sold_field} FROM stock WHERE id=?)+1 >= IFNULL({cap_field},0) THEN 1 ELSE IFNULL(is_sold,0) END
+                 WHERE id=? AND (chosen_mode IS NULL OR chosen_mode=?)
+            """, (mode, sid, sid, mode))
+
+            if db.total_changes == 0:
+                await db.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (price, user_id))
+                raise ValueError("RACE")
+
+            await db.execute("""
+                INSERT INTO sales_history(user_id, stock_id, category, credential, price_paid, mode_sold)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (user_id, sid, chosen[1], chosen[3], price, mode))
+
+            await db.commit()
+            return {"ok": True, "row": chosen, "price": price}
+        except Exception:
+            with contextlib.suppress(Exception):
+                await db.rollback()
+            raise
+
 @dp.callback_query(F.data.startswith("buy::"))
 async def cb_buy(c: CallbackQuery):
     _, category, mode = c.data.split("::",2)
-    row = await find_item_with_mode(category, mode)
-    if not row: await c.answer("لا يوجد عنصر متاح الآن.", show_alert=True); return
-    price = price_for_mode(row, mode)
-    bal = await get_or_create_user(c.from_user.id)
-    if bal < price:
-        await c.answer(f"رصيدك لا يكفي. السعر {price:g} ج.م ورصيدك {bal:g} ج.م", show_alert=True); return
-    if not await change_balance(c.from_user.id, -price):
-        await c.answer("فشل الخصم.", show_alert=True); return
-    ok = await increment_sale_and_finalize(row, mode)
-    if not ok:
-        await change_balance(c.from_user.id, +price)
-        await c.answer("نفذ المخزون أثناء الشراء.", show_alert=True); return
-    await log_sale(c.from_user.id, row, price, mode)
+    try:
+        res = await atomic_buy(c.from_user.id, category, mode)
+    except ValueError as e:
+        code = str(e)
+        if code == "LOW_BAL":
+            bal = await get_or_create_user(c.from_user.id)
+            item = await find_item_with_mode(category, mode)
+            price = price_for_mode(item, mode) if item else 0
+            await c.answer(f"رصيدك لا يكفي. السعر {price:g} ج.م ورصيدك {bal:g} ج.م", show_alert=True)
+        elif code in ("NO_ITEM","NO_STOCK"):
+            await c.answer("لا يوجد عنصر متاح الآن.", show_alert=True)
+        else:
+            await c.answer("حدث تعارض أثناء الشراء. جرّب مرة أخرى.", show_alert=True)
+        return
+
+    row = res["row"]; price = res["price"]
     credential = escape(row[3])
-    
     instructions = await get_instruction(category, mode)
     message_text = f"📩 <b>بيانات حسابك:</b>\n<code>{credential}</code>"
     if instructions:
-        message_text += f"\n\n{instructions}"
+        message_text += f"\n\n<pre>{escape(instructions)}</pre>"
     try:
         await bot.send_message(c.from_user.id, message_text, parse_mode="HTML")
-    except Exception: pass
+    except Exception:
+        pass
 
     await c.message.edit_text(f"✅ تم الشراء: {category}\nالنوع: {mode}\nالسعر: {price:g} ج.م\n\nتم إرسال البيانات والتعليمات في رسالة خاصة.")
 
+# ==================== WEBHOOK: PAYMOB ====================
+# Helper: build string for HMAC verification (based on Paymob docs)
+def _hmac_concat_from_obj(obj: dict) -> str:
+    """
+    Build the HMAC concatenation string using standard Paymob fields.
+    This uses common fields Paymob sends in 'obj' transaction.
+    If some fields are missing, use empty strings for them.
+    """
+    t = obj or {}
+    order = t.get("order", {}) or {}
+    source_data = t.get("source_data", {}) or {}
+
+    # Common/important fields; keep order exactly
+    fields = [
+        str(t.get("amount_cents", "")),
+        str(t.get("created_at", "")),
+        str(t.get("currency", "")),
+        str(t.get("error_occured", "")),    # note: Paymob uses this exact key
+        str(t.get("has_parent_transaction", "")),
+        str(t.get("id", "")),
+        str(t.get("integration_id", "")),
+        str(t.get("is_3d_secure", "")),
+        str(t.get("is_auth", "")),
+        str(t.get("is_capture", "")),
+        str(t.get("is_refunded", "")),
+        str(t.get("is_standalone_payment", "")),
+        str(t.get("is_voided", "")),
+        str(order.get("id", "")),
+        str(t.get("owner", "")),
+        str(t.get("pending", "")),
+        str(source_data.get("pan", "")),
+        str(source_data.get("sub_type", "")),
+        str(source_data.get("type", "")),
+        str(t.get("success", "")),
+    ]
+    return "".join(fields)
+
+def verify_paymob_hmac(secret: str, payload: dict, received_hmac: str) -> bool:
+    if not secret or not received_hmac:
+        return False
+    try:
+        concat = _hmac_concat_from_obj(payload.get("obj") or payload)
+        expected = hmac.new(secret.encode(), concat.encode(), hashlib.sha512).hexdigest()
+        return hmac.compare_digest(expected, received_hmac)
+    except Exception as e:
+        print("[HMAC VERIFY ERROR]", e)
+        return False
+
+async def mark_payment_paid(merchant_order_id: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id, user_id, amount_cents, status FROM payments WHERE merchant_order_id=?", (merchant_order_id,))
+        row = await cur.fetchone()
+        if not row:
+            print("[WEBHOOK] Unknown merchant_order_id:", merchant_order_id)
+            return False
+        pid, user_id, amount_cents, status = row
+        if status == "paid":
+            return True  # idempotent
+        await db.execute("UPDATE payments SET status='paid' WHERE id=?", (pid,))
+        await db.commit()
+    # Credit balance safely
+    amount = (amount_cents or 0) / 100.0
+    await change_balance(user_id, amount)
+    # Notify user
+    try:
+        await bot.send_message(user_id, f"✅ تم شحن رصيدك بمبلغ {amount:g} ج.م.\nشكراً لك!")
+    except Exception:
+        pass
+    return True
+
+# aiohttp route
+async def paymob_webhook(request: web.Request):
+    try:
+        if request.content_type == "application/json":
+            data = await request.json()
+        else:
+            # Accept form-encoded also
+            post = await request.post()
+            data = {k: v for k, v in post.items()}
+            if "obj" in data and isinstance(data["obj"], str):
+                try:
+                    data["obj"] = json.loads(data["obj"])
+                except Exception:
+                    pass
+        # Paymob may send 'hmac' either in query or body
+        received_hmac = request.query.get("hmac") or data.get("hmac") or ""
+        valid = True
+        if PAYMOB_HMAC_SECRET:
+            valid = verify_paymob_hmac(PAYMOB_HMAC_SECRET, data, received_hmac)
+        if not valid:
+            return web.json_response({"ok": False, "reason": "invalid_hmac"}, status=400)
+
+        obj = data.get("obj") or data  # support both
+        success = bool(obj.get("success"))
+        order_info = obj.get("order") or {}
+        merchant_order_id = str(order_info.get("merchant_order_id") or obj.get("merchant_order_id") or "")
+        amount_cents = int(obj.get("amount_cents") or 0)
+
+        if not merchant_order_id:
+            return web.json_response({"ok": False, "reason": "missing_merchant_order_id"}, status=400)
+
+        if success:
+            ok = await mark_payment_paid(merchant_order_id)
+            return web.json_response({"ok": ok})
+        else:
+            # Optionally mark failed
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE payments SET status='failed' WHERE merchant_order_id=? AND status='pending'", (merchant_order_id,))
+                await db.commit()
+            return web.json_response({"ok": True, "status": "failed"})
+    except Exception as e:
+        print("[WEBHOOK ERROR]", e)
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+# ==================== ADMIN: MANUAL CONFIRM ====================
+@dp.message(Command("confirmcharge"))
+async def confirm_cmd(m: Message, command: CommandObject):
+    if not is_admin(m.from_user.id): return
+    merchant_order_id = (command.args or "").strip()
+    if not merchant_order_id:
+        await m.reply("الاستخدام: /confirmcharge <merchant_order_id>"); return
+    ok = await mark_payment_paid(merchant_order_id)
+    await m.reply("✅ تم تأكيد العملية وشحن الرصيد." if ok else "❌ لم يتم العثور على العملية.")
+
 # ==================== RUN ====================
+async def run_web_app():
+    app = web.Application()
+    path = WEB_BASE_PATH + "/paymob/webhook"
+    app.router.add_post(path, paymob_webhook)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, WEB_HOST, WEB_PORT)
+    await site.start()
+    print(f"[WEB] Paymob webhook listening on http://{WEB_HOST}:{WEB_PORT}{path}")
+
 async def main():
     await init_db()
     print("Bot started.")
@@ -693,19 +984,15 @@ async def main():
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
         print("[WARN] delete_webhook:", e)
-    
-    # This will catch all other text messages
+
+    # Start webhook server (background task)
+    await run_web_app()
+
+    # Fallback handler (optional)
     @dp.message()
-    async def pasted_imports(m: Message):
-        st = getattr(dp, "workflow_state", {})
-        w_m = st.get("awaiting_importm"); w_s = st.get("awaiting_import")
-        # Check if a workflow is active and if the user is the admin for that workflow
-        if (w_m and w_m.get("admin") == m.from_user.id) or \
-           (w_s and w_s.get("admin") == m.from_user.id):
-            if is_admin(m.from_user.id):
-                await process_import(m.text or "", is_multi_mode=bool(w_m), message=m)
-                dp.workflow_state = {}
-                return
+    async def fallback_handler(m: Message):
+        if m.text and m.text.startswith('/'):
+            return
 
     await dp.start_polling(bot)
 
