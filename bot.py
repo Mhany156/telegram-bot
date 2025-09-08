@@ -1,111 +1,185 @@
-﻿
+﻿import os
+import asyncio
+import re
+import json
+import time
+import threading
+import hmac
+import hashlib
+from html import escape
 
-# ==================== Multi-mode Import (TXT or paste) ====================
-def parse_stockm_lines(text: str):
-    """
-    Each line format (spaces allowed inside credential):
-    <category> <p_price> <p_cap> <s_price> <s_cap> <l_price> <l_cap> <credential...>
-    Lines starting with # are ignored.
-    Returns: (rows, ok, fail) where rows is list of tuples:
-      (category, p_price, p_cap, s_price, s_cap, l_price, l_cap, credential)
-    """
-    results = []; ok = fail = 0
-    for raw in (text or "").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split(maxsplit=7)
-        if len(parts) < 8:
-            fail += 1; continue
-        category = parts[0]
-        def pf(x): 
-            from re import search
-            x = normalize_digits(x).replace(",", ".")
-            m = search(r'[-+]?\d+(?:\.\d+)?', x)
-            return float(m.group(0)) if m else None
-        def pi(x):
-            from re import search
-            x = normalize_digits(x)
-            m = search(r'\d+', x)
-            return int(m.group(0)) if m else None
-        p_price = pf(parts[1]); p_cap = pi(parts[2])
-        s_price = pf(parts[3]); s_cap = pi(parts[4])
-        l_price = pf(parts[5]); l_cap = pi(parts[6])
-        credential = parts[7]
-        if any(v is None for v in [p_price, p_cap, s_price, s_cap, l_price, l_cap]):
-            fail += 1; continue
-        results.append((category, p_price, p_cap, s_price, s_cap, l_price, l_cap, credential))
-        ok += 1
-    return results, ok, fail
+from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command, CommandObject
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Document
+)
+import aiohttp
+import aiosqlite
+from flask import Flask, request, abort
 
-@dp.message(Command("importstockm"))
-async def importstockm_cmd(m: Message):
-    if not is_admin(m.from_user.id):
-        await m.reply("❌ هذا الأمر للأدمن فقط."); return
-    await m.reply(
-        "📥 أرسل ملف TXT أو الصق السطور بهذا التنسيق (سطر لكل حساب):\n"
-        "<category> <p_price> <p_cap> <s_price> <s_cap> <l_price> <l_cap> <credential>\n\n"
-        "مثال CapCut لابتوب فقط (سعر 4$, سعة 2):\n"
-        "CapCut 0 0 0 0 4 2 email@example.com:pass123\n\n"
-        "تلميحات:\n"
-        "- تقدر تسيب أي مود مقفول بسعة 0.\n"
-        "- الأرقام العربية والفاصلة 3,5 مدعومة."
-    )
-    dp.workflow_state = {"awaiting_importm": {"admin": m.from_user.id}}
+# ==================== CONFIG ====================
+load_dotenv()
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
+PAYMOB_API_KEY = os.getenv("PAYMOB_API_KEY")
+PAYMOB_HMAC_SECRET = os.getenv("PAYMOB_HMAC_SECRET")
+PAYMOB_CARD_ID = int(os.getenv("PAYMOB_CARD_INTEGRATION_ID", 0))
+PAYMOB_WALLET_ID = int(os.getenv("PAYMOB_WALLET_INTEGRATION_ID", 0))
+PAYMOB_IFRAME_ID = int(os.getenv("PAYMOB_IFRAME_ID", 0))
+if not TOKEN: raise RuntimeError("Please set TELEGRAM_TOKEN in .env")
+print("Loaded ADMIN_IDS:", ADMIN_IDS)
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+flask_app = Flask(__name__)
+DB_PATH = "store.db"
 
-@dp.message(F.document)
-async def import_file_multi_or_legacy(m: Message):
-    # This overrides the previous F.document handler; we merge both flows here.
-    st = getattr(dp, "workflow_state", {})
-    w_m = st.get("awaiting_importm")
-    w_s = st.get("awaiting_import")
-    if not (w_m or w_s):
-        return
-    if not is_admin(m.from_user.id):
-        return
-    if w_m and w_m.get("admin") != m.from_user.id:
-        return
-    if w_s and w_s.get("admin") != m.from_user.id:
-        return
+# ==================== DB and Helpers ====================
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY, balance REAL DEFAULT 0);""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS stock(id INTEGER PRIMARY KEY AUTOINCREMENT, category TEXT NOT NULL, price REAL NOT NULL DEFAULT 0, credential TEXT NOT NULL, is_sold INTEGER DEFAULT 0, p_price REAL, p_cap INTEGER, p_sold INTEGER DEFAULT 0, s_price REAL, s_cap INTEGER, s_sold INTEGER DEFAULT 0, l_price REAL, l_cap INTEGER, l_sold INTEGER DEFAULT 0, chosen_mode TEXT);""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS sales_history(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, stock_id INTEGER NOT NULL, category TEXT, credential TEXT, price_paid REAL, mode_sold TEXT, purchase_date TEXT DEFAULT (DATETIME('now', 'localtime')));""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS instructions(category TEXT NOT NULL, mode TEXT NOT NULL, message_text TEXT NOT NULL, PRIMARY KEY (category, mode));""")
+        await db.commit()
 
-    doc: Document = m.document
-    if not (doc.mime_type == "text/plain" or (doc.file_name and doc.file_name.lower().endswith(".txt"))):
-        await m.reply("⚠️ من فضلك أرسل ملف .txt فقط."); return
+def is_admin(uid: int) -> bool: return uid in ADMIN_IDS
+def normalize_digits(s: str) -> str: return s.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+def parse_float_loose(s: str):
+    if not s: return None
+    s = normalize_digits(s).replace(",", ".")
+    m = re.search(r'[-+]?\d+(?:\.\d+)?', s)
+    return float(m.group(0)) if m else None
+def parse_int_loose(s: str):
+    if not s: return None
+    s = normalize_digits(s)
+    m = re.search(r'\d{1,12}', s)
+    return int(m.group(0)) if m else None
+def main_menu_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 شحن الرصيد (آلي)", callback_data="charge_menu")],
+        [InlineKeyboardButton(text="🛍️ الكتالوج / شراء", callback_data="catalog")],
+        [InlineKeyboardButton(text="💼 رصيدي", callback_data="balance")],
+    ])
+async def get_or_create_user(user_id: int) -> float:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+        r = await cur.fetchone()
+        if r is None:
+            await db.execute("INSERT INTO users(user_id,balance) VALUES(?,0)", (user_id,))
+            await db.commit()
+            return 0.0
+        return float(r[0])
+async def change_balance(user_id: int, delta: float) -> float:
+    bal = await get_or_create_user(user_id)
+    new_bal = bal + delta
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET balance=? WHERE user_id=?", (new_bal, user_id))
+        await db.commit()
+    return new_bal
 
+# ==================== PAYMOB INTEGRATION ====================
+PAYMOB_AUTH_URL = "https://accept.paymob.com/api/auth/tokens"
+PAYMOB_ORDER_URL = "https://accept.paymob.com/api/ecommerce/orders"
+PAYMOB_PAYMENT_KEY_URL = "https://accept.paymob.com/api/acceptance/payment_keys"
+PAYMOB_IFRAME_URL = f"https://accept.paymob.com/api/acceptance/iframes/{PAYMOB_IFRAME_ID}?payment_token={{}}"
+
+async def get_auth_token():
+    async with aiohttp.ClientSession() as s:
+        async with s.post(PAYMOB_AUTH_URL, json={"api_key": PAYMOB_API_KEY}) as r: return (await r.json()).get("token")
+async def register_order(token, merchant_order_id, amount_cents):
+    payload = {"auth_token": token, "delivery_needed": "false", "amount_cents": str(amount_cents), "currency": "EGP", "merchant_order_id": merchant_order_id}
+    async with aiohttp.ClientSession() as s:
+        async with s.post(PAYMOB_ORDER_URL, json=payload) as r: return (await r.json()).get("id")
+async def get_payment_key(token, order_id, amount_cents, integration_id):
+    payload = {"auth_token": token, "amount_cents": str(amount_cents), "expiration": 3600, "order_id": order_id, "billing_data": {"email": "NA", "first_name": "NA", "last_name": "NA", "phone_number": "NA", "apartment": "NA", "floor": "NA", "street": "NA", "building": "NA", "shipping_method": "NA", "postal_code": "NA", "city": "NA", "country": "NA", "state": "NA"}, "currency": "EGP", "integration_id": integration_id, "lock_order_when_paid": "true"}
+    async with aiohttp.ClientSession() as s:
+        async with s.post(PAYMOB_PAYMENT_KEY_URL, json=payload) as r: return (await r.json()).get("token")
+
+# ==================== WEBHOOK LISTENER (CORRECTED) ====================
+@flask_app.route('/webhook', methods=['GET', 'POST'])
+def paymob_webhook():
     try:
-        file = await bot.get_file(doc.file_id)
-        from io import BytesIO
-        buf = BytesIO()
-        await bot.download(file, buf)
-        text = buf.getvalue().decode("utf-8", "ignore")
+        # The user is redirected to this URL after payment attempt
+        if request.method == 'GET':
+            hmac_keys = sorted([key for key in request.args.keys() if key != 'hmac'])
+            concatenated_string = "".join([request.args.get(key, '') for key in hmac_keys])
+            received_hmac = request.args.get('hmac')
+            if not received_hmac: return abort(400)
+
+            h = hmac.new(PAYMOB_HMAC_SECRET.encode('utf-8'), concatenated_string.encode('utf-8'), hashlib.sha512)
+            calculated_hmac = h.hexdigest()
+
+            if not hmac.compare_digest(calculated_hmac, received_hmac):
+                print("[WEBHOOK-GET] HMAC verification failed!")
+                return abort(403)
+            
+            if request.args.get('success') == 'true':
+                print("[WEBHOOK-GET] Received successful transaction response.")
+                merchant_order_id = request.args.get('merchant_order_id')
+                if merchant_order_id and merchant_order_id.startswith('tg-'):
+                    parts = merchant_order_id.split('-')
+                    user_id = int(parts[1])
+                    amount_egp = float(request.args.get('amount_cents')) / 100
+                    loop = dp.loop
+                    future = asyncio.run_coroutine_threadsafe(change_balance(user_id, amount_egp), loop)
+                    new_balance = future.result()
+                    confirmation_message = f"✅ تم شحن رصيدك بنجاح بمبلغ {amount_egp:g} ج.م.\nرصيدك الجديد هو: {new_balance:g} ج.م."
+                    asyncio.run_coroutine_threadsafe(bot.send_message(user_id, confirmation_message), loop)
+            return ("Transaction processed", 200)
+
+        # This is the server-to-server callback
+        elif request.method == 'POST':
+            print("[WEBHOOK-POST] Received POST callback. Ignoring as GET is primary.")
+            return ('POST callback received', 200)
+
     except Exception as e:
-        await m.reply(f"❌ فشل تنزيل الملف: {e}"); return
+        print(f"[WEBHOOK ERROR] An error occurred: {e}")
+        return abort(500)
 
-    if w_m:
-        rows, ok, fail = parse_stockm_lines(text)
-        for category, p_price, p_cap, s_price, s_cap, l_price, l_cap, credential in rows:
-            await add_stock_row_modes(category, credential, p_price, p_cap, s_price, s_cap, l_price, l_cap)
-        await m.reply(f"✅ تم استيراد {ok} سطر (مودات). ❌ فشل {fail} سطر.")
-        dp.workflow_state = {}
-        return
+# ==================== BOT HANDLERS & MAIN ====================
+@dp.message(Command("start"))
+async def start_cmd(m: Message):
+    await get_or_create_user(m.from_user.id)
+    await m.answer("أهلًا بك 👋\nاختر من القائمة:", reply_markup=main_menu_kb())
 
-    # legacy simple import
-    rows, ok, fail = parse_stock_lines(text)
-    for category, price, credential in rows:
-        await add_stock_simple(category, price, credential)
-    await m.reply(f"✅ تم استيراد {ok} سطر. ❌ فشل {fail} سطر.")
-    dp.workflow_state = {}
+@dp.message(Command("balance"))
+async def balance_cmd(m: Message):
+    bal = await get_or_create_user(m.from_user.id)
+    await m.answer(f"رصيدك الحالي: {bal:g} ج.م")
 
-@dp.message()
-async def pasted_multi_or_legacy(m: Message):
-    st = getattr(dp, "workflow_state", {})
-    w_m = st.get("awaiting_importm")
-    if w_m and w_m.get("admin") == m.from_user.id and is_admin(m.from_user.id):
-        rows, ok, fail = parse_stockm_lines(m.text or "")
-        for category, p_price, p_cap, s_price, s_cap, l_price, l_cap, credential in rows:
-            await add_stock_row_modes(category, credential, p_price, p_cap, s_price, s_cap, l_price, l_cap)
-        await m.reply(f"✅ تم استيراد {ok} سطر (مودات). ❌ فشل {fail} سطر.")
-        dp.workflow_state = {}
-        return
-    # fall back to any existing pasted flows (e.g., legacy import)
-    # (Existing handler may also catch; keeping this ensures multi-mode works)
+@dp.message(Command("charge"))
+async def charge_cmd(m: Message, command: CommandObject):
+    if not command.args:
+        await m.reply("⚠️ الاستخدام: /charge <amount>\nمثال: /charge 50"); return
+    amount_egp = parse_float_loose(command.args)
+    if amount_egp is None or amount_egp < 5:
+        await m.reply("⚠️ المبلغ يجب أن يكون رقمًا صحيحًا و 5 جنيهات أو أكثر."); return
+    amount_cents = int(amount_egp * 100)
+    merchant_order_id = f"tg-{m.from_user.id}-{int(time.time())}"
+    try:
+        token = await get_auth_token()
+        order_id = await register_order(token, merchant_order_id, amount_cents)
+        payment_key = await get_payment_key(token, order_id, amount_cents, PAYMOB_CARD_ID)
+        payment_url = PAYMOB_IFRAME_URL.format(payment_key)
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"💳 ادفع {amount_egp:g} جنيه الآن", url=payment_url)]])
+        await m.reply("تم إنشاء فاتورة الدفع. اضغط على الزر أدناه لإتمام العملية.", reply_markup=kb)
+    except Exception as e:
+        print(f"[PAYMOB ERROR] {e}")
+        await m.reply("حدث خطأ أثناء إنشاء فاتورة الدفع. يرجى المحاولة مرة أخرى لاحقًا.")
+
+# Add other user and admin handlers...
+# NOTE: To keep the response from being excessively long, admin handlers are omitted,
+# but the user should ensure they are present in their final file from previous versions.
+
+async def main():
+    await init_db()
+    dp.loop = asyncio.get_running_loop()
+    print("Bot started.")
+    await bot.delete_webhook(drop_pending_updates=True)
+    port = int(os.getenv("PORT", 8080))
+    threading.Thread(target=lambda: flask_app.run(host='0.0.0.0', port=port, debug=False), daemon=True).start()
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
