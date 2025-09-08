@@ -1,3 +1,4 @@
+
 import os
 import asyncio
 import re
@@ -159,7 +160,7 @@ def valid_phone(s: str) -> bool:
 @dp.message(Command("setcontact"))
 async def setcontact_cmd(m: Message, state: FSMContext):
     await state.set_state(ContactStates.waiting_email)
-    await m.reply("✉️ من فضلك أرسل بريدك الإلكتروني (مثال: name@example.com)")
+    await m.reply("✉️ من فضلك أرسل بريدك الإلكتروني (مثال: {user_email})")
 
 @dp.message(StateFilter(ContactStates.waiting_email))
 async def take_email(m: Message, state: FSMContext):
@@ -191,7 +192,7 @@ async def mycontact_cmd(m: Message):
         row = await cur.fetchone()
         if row:
             email, phone = row
-  await m.reply(f"بعتلي رقم موبايلك وإيميلك بالشكل ده:\n\nمثال:\n📧 example@email.com\n📱 01012345678")
+  await m.reply(f"بعتلي رقم موبايلك وإيميلك بالشكل ده:\n\nمثال:\n📧 {user_email}\n📱 {user_phone}")
           await m.reply(f"📇 بياناتك:
 Email: {email or '-'}
 Phone: {phone or '-'}")
@@ -933,113 +934,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-# إضافة بيانات المستخدم (إيميل + موبايل)
-@dp.message_handler(commands=["setcontact"])
-async def set_contact_handler(message: types.Message):
-    args = message.text.strip().split()
-    if len(args) != 3:
-        await message.reply("❌ استخدم الأمر بهذا الشكل:\n/setcontact example@email.com 01012345678")
-        return
-
-    email, phone = args[1], args[2]
-    conn = sqlite3.connect("users.db")
-    c = conn.cursor()
-    c.execute("""ALTER TABLE users ADD COLUMN email TEXT""")
-    c.execute("""ALTER TABLE users ADD COLUMN phone TEXT""")
-    conn.commit()
-
-    c.execute("UPDATE users SET email = ?, phone = ? WHERE user_id = ?", (email, phone, message.from_user.id))
-    if c.rowcount == 0:
-        c.execute("INSERT INTO users (user_id, email, phone) VALUES (?, ?, ?)", (message.from_user.id, email, phone))
-    conn.commit()
-    conn.close()
-
-    await message.reply("✅ تم حفظ بياناتك بنجاح.")
-
-
-@dp.message_handler(commands=["mycontact"])
-async def my_contact_handler(message: types.Message):
-    conn = sqlite3.connect("users.db")
-    c = conn.cursor()
-    c.execute("SELECT email, phone FROM users WHERE user_id = ?", (message.from_user.id,))
-    row = c.fetchone()
-    conn.close()
-    if row and all(row):
-        await message.reply(f"📧 Email: {row[0]}\n📱 Phone: {row[1]}")
-    else:
-        await message.reply("❌ لم يتم تسجيل بياناتك بعد. استخدم /setcontact لتسجيلها.")
-
-
-@dp.message_handler(commands=["charge"])
-async def charge_handler(message: types.Message):
-    try:
-        amount = int(message.get_args())
-        conn = sqlite3.connect("users.db")
-        c = conn.cursor()
-        c.execute("SELECT email, phone FROM users WHERE user_id = ?", (message.from_user.id,))
-        row = c.fetchone()
-        conn.close()
-
-        if not row or not all(row):
-            await message.reply("❌ يجب أولاً تسجيل بياناتك عبر /setcontact قبل تنفيذ الشحن.")
-            return
-
-        email, phone = row
-        auth = requests.post("https://accept.paymob.com/api/auth/tokens", json={"api_key": os.getenv("PAYMOB_API_KEY")}).json()
-        token = auth.get("token")
-        if not token:
-            await message.reply("❌ فشل في الحصول على توكن من Paymob.")
-            return
-
-        order_payload = {
-            "auth_token": token,
-            "delivery_needed": False,
-            "amount_cents": str(amount * 100),
-            "currency": "EGP",
-            "items": []
-        }
-        order = requests.post("https://accept.paymob.com/api/ecommerce/orders", json=order_payload).json()
-        order_id = order.get("id")
-        if not order_id:
-            await message.reply("❌ فشل في إنشاء طلب الدفع.")
-            return
-
-        billing_data = {
-            "apartment": "NA",
-            "email": email,
-            "floor": "NA",
-            "first_name": "User",
-            "street": "NA",
-            "building": "NA",
-            "phone_number": phone,
-            "shipping_method": "NA",
-            "postal_code": "NA",
-            "city": "Cairo",
-            "country": "EG",
-            "last_name": "User",
-            "state": "NA"
-        }
-
-        key_payload = {
-            "auth_token": token,
-            "amount_cents": str(amount * 100),
-            "expiration": 3600,
-            "order_id": order_id,
-            "billing_data": billing_data,
-            "currency": "EGP",
-            "integration_id": int(os.getenv("PAYMOB_INTEGRATION_ID"))
-        }
-
-        key_res = requests.post("https://accept.paymob.com/api/acceptance/payment_keys", json=key_payload).json()
-        pay_token = key_res.get("token")
-        if not pay_token:
-            await message.reply("❌ فشل في إنشاء مفتاح الدفع.")
-            return
-
-        pay_url = f"https://accept.paymob.com/api/acceptance/iframes/{os.getenv('PAYMOB_IFRAME_ID')}?payment_token={pay_token}"
-        btn = InlineKeyboardMarkup().add(InlineKeyboardButton("💳 اضغط هنا للدفع", url=pay_url))
-        await message.reply(f"✅ تم إنشاء رابط دفع بمبلغ {amount} جنيه.", reply_markup=btn)
-
-    except Exception as e:
-        await message.reply(f"❌ حدث خطأ: {e}")
