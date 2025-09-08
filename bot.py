@@ -148,6 +148,9 @@ def main_menu_kb():
 # ---- users / balances ----
 
 # ==== CONTACT MANAGEMENT ====
+class ContactStates(StatesGroup):
+    waiting_email = State()
+    waiting_phone = State()
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 EG_PHONE_RE = re.compile(r"^\+?20?1[0-25]\d{8}$")
 
