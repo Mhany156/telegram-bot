@@ -77,13 +77,46 @@ async def change_balance(user_id: int, delta: float) -> float:
         await db.execute("UPDATE users SET balance=? WHERE user_id=?", (new_bal, user_id))
         await db.commit()
     return new_bal
+async def find_item_with_mode(category: str, mode: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id, category, price, credential, IFNULL(is_sold,0), p_price, p_cap, IFNULL(p_sold,0), s_price, s_cap, IFNULL(s_sold,0), l_price, l_cap, IFNULL(l_sold,0), chosen_mode FROM stock WHERE category=? AND IFNULL(is_sold,0)=0 ORDER BY id ASC", (category,))
+        items = await cur.fetchall()
+    for r in items:
+        chosen = r[14]
+        rem = max((r[{"personal": 6, "shared": 9, "laptop": 12}[mode]] or 0) - (r[{"personal": 7, "shared": 10, "laptop": 13}[mode]] or 0), 0)
+        pr = r[{"personal": 5, "shared": 8, "laptop": 11}[mode]]
+        if pr is None or rem <= 0: continue
+        if chosen is None or chosen == mode: return r
+    return None
+async def increment_sale_and_finalize(stock_row, mode: str):
+    id_ = stock_row[0]
+    sold_field, cap_field = {"personal": ("p_sold","p_cap"), "shared": ("s_sold","s_cap"), "laptop": ("l_sold","l_cap")}[mode]
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(f"SELECT {sold_field},{cap_field},chosen_mode FROM stock WHERE id=?", (id_,))
+        s, cap, ch = await cur.fetchone()
+        ch = mode if ch is None else ch; s = 0 if s is None else s; cap = 0 if cap is None else cap
+        if ch != mode or s >= cap: return False
+        s += 1
+        is_sold_val = 1 if s >= cap else 0
+        await db.execute(f"UPDATE stock SET {sold_field}=?, chosen_mode=?, is_sold=CASE WHEN ?=1 THEN 1 ELSE IFNULL(is_sold,0) END WHERE id=?", (s, ch, is_sold_val, id_))
+        await db.commit()
+    return True
+async def log_sale(user_id: int, stock_row: tuple, price: float, mode: str):
+    stock_id, category, _, credential, *_ = stock_row
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO sales_history(user_id, stock_id, category, credential, price_paid, mode_sold) VALUES (?, ?, ?, ?, ?, ?)", (user_id, stock_id, category, credential, price, mode))
+        await db.commit()
+async def get_instruction(category: str, mode: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT message_text FROM instructions WHERE category=? AND mode=?", (category, mode))
+        row = await cur.fetchone()
+        return row[0] if row else None
 
 # ==================== PAYMOB INTEGRATION ====================
 PAYMOB_AUTH_URL = "https://accept.paymob.com/api/auth/tokens"
 PAYMOB_ORDER_URL = "https://accept.paymob.com/api/ecommerce/orders"
 PAYMOB_PAYMENT_KEY_URL = "https://accept.paymob.com/api/acceptance/payment_keys"
 PAYMOB_IFRAME_URL = f"https://accept.paymob.com/api/acceptance/iframes/{PAYMOB_IFRAME_ID}?payment_token={{}}"
-
 async def get_auth_token():
     async with aiohttp.ClientSession() as s:
         async with s.post(PAYMOB_AUTH_URL, json={"api_key": PAYMOB_API_KEY}) as r: return (await r.json()).get("token")
@@ -96,24 +129,20 @@ async def get_payment_key(token, order_id, amount_cents, integration_id):
     async with aiohttp.ClientSession() as s:
         async with s.post(PAYMOB_PAYMENT_KEY_URL, json=payload) as r: return (await r.json()).get("token")
 
-# ==================== WEBHOOK LISTENER (CORRECTED) ====================
+# ==================== WEBHOOK LISTENER ====================
 @flask_app.route('/webhook', methods=['GET', 'POST'])
 def paymob_webhook():
     try:
-        # The user is redirected to this URL after payment attempt
         if request.method == 'GET':
             hmac_keys = sorted([key for key in request.args.keys() if key != 'hmac'])
             concatenated_string = "".join([request.args.get(key, '') for key in hmac_keys])
             received_hmac = request.args.get('hmac')
             if not received_hmac: return abort(400)
-
             h = hmac.new(PAYMOB_HMAC_SECRET.encode('utf-8'), concatenated_string.encode('utf-8'), hashlib.sha512)
             calculated_hmac = h.hexdigest()
-
             if not hmac.compare_digest(calculated_hmac, received_hmac):
                 print("[WEBHOOK-GET] HMAC verification failed!")
                 return abort(403)
-            
             if request.args.get('success') == 'true':
                 print("[WEBHOOK-GET] Received successful transaction response.")
                 merchant_order_id = request.args.get('merchant_order_id')
@@ -127,12 +156,9 @@ def paymob_webhook():
                     confirmation_message = f"✅ تم شحن رصيدك بنجاح بمبلغ {amount_egp:g} ج.م.\nرصيدك الجديد هو: {new_balance:g} ج.م."
                     asyncio.run_coroutine_threadsafe(bot.send_message(user_id, confirmation_message), loop)
             return ("Transaction processed", 200)
-
-        # This is the server-to-server callback
         elif request.method == 'POST':
             print("[WEBHOOK-POST] Received POST callback. Ignoring as GET is primary.")
             return ('POST callback received', 200)
-
     except Exception as e:
         print(f"[WEBHOOK ERROR] An error occurred: {e}")
         return abort(500)
@@ -142,12 +168,10 @@ def paymob_webhook():
 async def start_cmd(m: Message):
     await get_or_create_user(m.from_user.id)
     await m.answer("أهلًا بك 👋\nاختر من القائمة:", reply_markup=main_menu_kb())
-
 @dp.message(Command("balance"))
 async def balance_cmd(m: Message):
     bal = await get_or_create_user(m.from_user.id)
     await m.answer(f"رصيدك الحالي: {bal:g} ج.م")
-
 @dp.message(Command("charge"))
 async def charge_cmd(m: Message, command: CommandObject):
     if not command.args:
@@ -167,11 +191,20 @@ async def charge_cmd(m: Message, command: CommandObject):
     except Exception as e:
         print(f"[PAYMOB ERROR] {e}")
         await m.reply("حدث خطأ أثناء إنشاء فاتورة الدفع. يرجى المحاولة مرة أخرى لاحقًا.")
-
-# Add other user and admin handlers...
-# NOTE: To keep the response from being excessively long, admin handlers are omitted,
-# but the user should ensure they are present in their final file from previous versions.
-
+@dp.callback_query(F.data == "charge_menu")
+async def cb_charge_menu(c: CallbackQuery):
+    await c.message.edit_text("لشحن رصيدك، استخدم الأمر التالي في الشات مباشرة:\n`/charge <amount>`\n\n**مثال:**\n`/charge 100` لشحن 100 جنيه.", parse_mode="Markdown")
+@dp.callback_query(F.data == "back_home")
+async def cb_back_home(c: CallbackQuery):
+    await c.message.edit_text("اختر من القائمة:", reply_markup=main_menu_kb())
+@dp.callback_query(F.data == "balance")
+async def cb_balance(c: CallbackQuery):
+    bal = await get_or_create_user(c.from_user.id)
+    await c.message.edit_text(f"رصيدك الحالي: {bal:g} ج.م", reply_markup=main_menu_kb())
+@dp.callback_query(F.data == "catalog")
+async def cb_catalog(c: CallbackQuery):
+    # This is a placeholder for your catalog logic
+    await c.message.edit_text("This is the catalog. (Not fully implemented in this snippet)")
 async def main():
     await init_db()
     dp.loop = asyncio.get_running_loop()
@@ -180,6 +213,5 @@ async def main():
     port = int(os.getenv("PORT", 8080))
     threading.Thread(target=lambda: flask_app.run(host='0.0.0.0', port=port, debug=False), daemon=True).start()
     await dp.start_polling(bot)
-
 if __name__ == "__main__":
     asyncio.run(main())
