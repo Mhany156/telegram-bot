@@ -658,7 +658,11 @@ async def charge_cmd(m: Message, command: CommandObject):
             token=token, order_id=order_id, amount_cents=amount_cents,
             integration_id=PAYMOB_CARD_ID,
             user_details={
-                "email": f"user{m.from_user.id}_{int(time.time())}@example.com",
+        "email": f"user{m.from_user.id}_{int(time.time())}@example.com",
+        "first_name": m.from_user.first_name or "Telegram",
+        "last_name": m.from_user.last_name or "User",
+        "phone_number": f"+2010{str(m.from_user.id)[-8:]}"
+    }_{int(time.time())}@example.com",
                 "first_name": m.from_user.first_name or "Telegram",
                 "last_name": m.from_user.last_name or "User",
                 "phone_number": f"+2010{str(m.from_user.id)[-8:]}"
