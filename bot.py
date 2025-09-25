@@ -395,7 +395,7 @@ async def importstock_cmd(m: Message):
     await m.reply("📥 أرسل ملف TXT أو الصق سطور بصيغة:\n<category> <price> <credential>")
     dp.workflow_state = {"awaiting_import": {"admin": m.from_user.id}}
 
-@dp.message(Command("importstockm"))
+@dp.message(Command("importstockm", "addstockm"))
 async def importstockm_cmd(m: Message):
     if not is_admin(m.from_user.id): return
     await m.reply("📥 أرسل TXT أو الصق سطور بصيغة:\n<cat> <p_p> <p_c> <s_p> <s_c> <l_p> <l_c> <cred>")
