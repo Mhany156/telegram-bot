@@ -125,7 +125,7 @@ async def add_stock_row_modes(category: str, credential: str, p_price=None,p_cap
         await db.commit()
 
 async def add_stock_simple(category: str, price: float, credential: str):
-    await add_stock_row_modes(category, credential, p_price=price, p_cap=1)
+    await add_stock_row_modes(category, credential, p_price=price, p_cap=1, s_price=None, s_cap=0, l_price=None, l_cap=0)
 
 async def clear_stock_category(category: str) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
