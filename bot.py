@@ -133,6 +133,12 @@ async def clear_stock_category(category: str) -> int:
         await db.commit()
         return cur.rowcount
 
+async def delete_stock_item(stock_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("DELETE FROM stock WHERE id=?", (stock_id,))
+        await db.commit()
+        return cur.rowcount
+
 async def list_stock_items(category: str, limit: int = 20):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT id, price, credential, p_price, s_price, l_price FROM stock WHERE IFNULL(is_sold,0)=0 AND category=? ORDER BY id ASC LIMIT ?", (category, limit))
@@ -283,6 +289,18 @@ async def clearstock_cmd(m: Message, command: CommandObject):
     if not command.args: await m.reply("⚠️ الاستخدام: /clearstock <category>"); return
     count = await clear_stock_category(command.args.strip())
     await m.reply(f"🧹 تم حذف {count} عنصر.")
+
+@dp.message(Command("delstock"))
+async def delstock_cmd(m: Message, command: CommandObject):
+    if not is_admin(m.from_user.id): return
+    if not command.args: await m.reply("⚠️ الاستخدام: /delstock <stock_id>"); return
+    stock_id = parse_int_loose(command.args)
+    if stock_id is None: await m.reply("⚠️ يرجى إدخال معرف (ID) صحيح للمنتج."); return
+    count = await delete_stock_item(stock_id)
+    if count > 0:
+        await m.reply(f"🗑️ تم حذف {count} عنصر.")
+    else:
+        await m.reply("⚠️ لم يتم العثور على المنتج بهذا المعرف."); return
 
 @dp.message(Command("liststock"))
 async def liststock_cmd(m: Message, command: CommandObject):
