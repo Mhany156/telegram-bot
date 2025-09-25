@@ -181,17 +181,13 @@ async def list_modes_for_category(category: str):
     return res
 
 async def find_item_with_mode(category: str, mode: str):
+    cap_col, sold_col = {"personal": ("p_cap", "p_sold"), "shared": ("s_cap", "s_sold"), "laptop": ("l_cap", "l_sold")}[mode]
+    price_col = {"personal": "p_price", "shared": "s_price", "laptop": "l_price"}[mode]
+    
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT id, category, price, credential, IFNULL(is_sold,0), p_price, p_cap, IFNULL(p_sold,0), s_price, s_cap, IFNULL(s_sold,0), l_price, l_cap, IFNULL(l_sold,0), chosen_mode FROM stock WHERE category=? AND IFNULL(is_sold,0)=0 ORDER BY id ASC", (category,))
-        items = await cur.fetchall()
-    for r in items:
-        chosen = r[14]
-        rem = remaining_for_mode(r, mode)
-        pr = price_for_mode(r, mode)
-        if pr is None or rem <= 0: continue
-        if chosen is None or chosen == mode:
-            return r
-    return None
+        query = f"SELECT id, category, price, credential, IFNULL(is_sold,0), p_price, p_cap, IFNULL(p_sold,0), s_price, s_cap, IFNULL(s_sold,0), l_price, l_cap, IFNULL(l_sold,0), chosen_mode FROM stock WHERE category=? AND IFNULL(is_sold,0)=0 AND (IFNULL({cap_col},0) > IFNULL({sold_col},0)) AND {price_col} IS NOT NULL AND (chosen_mode IS NULL OR chosen_mode=?) ORDER BY (IFNULL({cap_col},0) - IFNULL({sold_col},0)) ASC, id ASC LIMIT 1"
+        cur = await db.execute(query, (category, mode))
+        return await cur.fetchone()
 
 async def increment_sale_and_finalize(stock_row, mode: str):
     id_ = stock_row[0]
