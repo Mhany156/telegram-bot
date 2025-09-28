@@ -5,7 +5,9 @@ import re
 import json
 import time
 import contextlib
+import sqlite3
 from html import escape
+from urllib.parse import urlencode
 import hmac
 import hashlib
 
@@ -323,14 +325,22 @@ async def find_item_with_mode(category: str, mode: str):
             ORDER BY id ASC
         """, (category,))
         items = await cur.fetchall()
-    for r in items:
-        chosen = r[14]
-        rem = remaining_for_mode(r, mode)
-        pr = price_for_mode(r, mode)
-        if pr is None or rem <= 0: continue
-        if chosen is None or chosen == mode:
-            return r
-    return None
+    best_row = None
+    best_price = None
+    for row in items:
+        chosen = row[14]
+        if chosen is not None and chosen != mode:
+            continue
+        if remaining_for_mode(row, mode) <= 0:
+            continue
+        price_val = price_for_mode(row, mode)
+        if price_val is None:
+            continue
+        price_val = float(price_val)
+        if best_row is None or price_val < best_price or (price_val == best_price and row[0] < best_row[0]):
+            best_row = row
+            best_price = price_val
+    return best_row
 
 # ==================== FSM: Import ====================
 class ImportStates(StatesGroup):
@@ -511,22 +521,34 @@ def page_id_for(category: str, mode: str) -> str | None:
     return KASHIER_PAGES.get(f"{category}:{mode}")
 
 def make_order_id(user_id: int, stock_id: int) -> str:
-    return f"tg-{user_id}-{stock_id}-{int(time.time())}"
+    return f"tg-{user_id}-{stock_id}-{time.time_ns()}"
 
 async def create_pending_and_checkout_url(user_id: int, item_row: tuple, mode: str, price: float) -> str | None:
     page_id = page_id_for(item_row[1], mode)
-    if not page_id: return None
+    if not page_id or not KASHIER_MERCHANT_ID:
+        return None
 
     stock_id = item_row[0]
-    merchant_order_id = make_order_id(user_id, stock_id)
-    amount_cents = int(price * 100)
+    amount_cents = int(round(float(price) * 100))
+    merchant_order_id = None
 
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO pending_orders (order_id, user_id, category, mode, stock_id, amount_cents)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (merchant_order_id, user_id, item_row[1], mode, stock_id, amount_cents))
-        await db.commit()
+        attempts = 0
+        while attempts < 5:
+            merchant_order_id = make_order_id(user_id, stock_id)
+            try:
+                await db.execute("""
+                    INSERT INTO pending_orders (order_id, user_id, category, mode, stock_id, amount_cents)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (merchant_order_id, user_id, item_row[1], mode, stock_id, amount_cents))
+                await db.commit()
+                break
+            except sqlite3.IntegrityError:
+                await db.rollback()
+                attempts += 1
+                merchant_order_id = None
+        if merchant_order_id is None:
+            raise RuntimeError("Could not reserve pending order entry")
 
     params = {
         "paymentId": page_id,
@@ -537,7 +559,7 @@ async def create_pending_and_checkout_url(user_id: int, item_row: tuple, mode: s
         "failUrl": KASHIER_FAIL_URL,
         "mode": KASHIER_MODE,
     }
-    query_string = "&".join([f"{k}={v}" for k, v in params.items() if v])
+    query_string = urlencode({k: v for k, v in params.items() if v})
     return f"{KASHIER_CHECKOUT_BASE}?{query_string}"
 
 @dp.callback_query(F.data.startswith("mode::"))
@@ -772,24 +794,53 @@ async def increment_sale_and_finalize(stock_id: int, mode: str) -> tuple[bool, d
 async def kashier_webhook(request: web.Request):
     try:
         body = await request.text()
-        data = json.loads(body)
-        event = data.get("event")
-        payload = data.get("data", {})
+        if not body:
+            return web.json_response({"ok": False, "reason": "empty_body"}, status=400)
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            return web.json_response({"ok": False, "reason": "invalid_json"}, status=400)
+
+        payload = data.get("data") or data.get("payload") or {}
+        event = str(data.get("event") or "").upper()
 
         if KASHIER_SECRET:
             received_hmac = request.headers.get("x-kashier-signature", "")
-            expected_hmac = hmac.new(KASHIER_SECRET.encode(), body.encode(), hashlib.sha256).hexdigest()
+            expected_hmac = hmac.new(KASHIER_SECRET.encode(), body.encode("utf-8"), hashlib.sha256).hexdigest()
             if not hmac.compare_digest(expected_hmac, received_hmac):
                 print("[KASHIER HMAC MISMATCH]")
                 return web.json_response({"ok": False, "reason": "invalid_hmac"}, status=400)
 
-        if event != "payment.success":
-            return web.json_response({"ok": True, "status": "event_ignored"})
-
-        merchant_order_id = payload.get("merchantOrderId")
+        merchant_order_id = str(
+            payload.get("merchantOrderId")
+            or data.get("merchantOrderId")
+            or payload.get("orderId")
+            or ""
+        ).strip()
         if not merchant_order_id:
             return web.json_response({"ok": False, "reason": "missing_merchant_order_id"}, status=400)
 
+        status_candidates = [
+            payload.get("status"),
+            payload.get("paymentStatus"),
+            payload.get("transactionStatus"),
+            payload.get("orderStatus"),
+            data.get("status"),
+        ]
+        status_value = next((s for s in status_candidates if s), "")
+        status_upper = status_value.upper()
+
+        success_statuses = {"PAID", "SUCCESS", "CAPTURED", "APPROVED"}
+        failure_statuses = {"FAILED", "FAIL", "DECLINED", "CANCELLED", "CANCELED", "VOID", "REJECTED", "ERROR"}
+        success_events = {"PAYMENT.SUCCESS", "PAYMENT.CAPTURED", "PAYMENT.APPROVED", "PAYMENT.PAID"}
+        failure_events = {"PAYMENT.FAILED", "PAYMENT.CANCELLED", "PAYMENT.CANCELED", "PAYMENT.REJECTED"}
+
+        is_success = status_upper in success_statuses or event in success_events
+        is_failure = status_upper in failure_statuses or event in failure_events
+        if not is_success and not is_failure and status_upper:
+            is_failure = status_upper not in success_statuses
+
+        item_row = None
         async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute("SELECT * FROM pending_orders WHERE order_id=?", (merchant_order_id,))
             pending_order = await cur.fetchone()
@@ -797,10 +848,20 @@ async def kashier_webhook(request: web.Request):
                 print(f"[WEBHOOK] Pending order not found: {merchant_order_id}")
                 return web.json_response({"ok": False, "reason": "order_not_found"})
 
-            order_db_id, _, user_id, category, mode, stock_id, amount_cents, _, status, _ = pending_order
+            order_db_id, _, user_id, category, mode, stock_id, amount_cents, _, pending_status, _ = pending_order
 
-            if status == "PAID":
+            if pending_status == "PAID" and is_success:
                 return web.json_response({"ok": True, "status": "already_processed"})
+            if pending_status == "FAILED" and is_failure:
+                return web.json_response({"ok": True, "status": "already_failed"})
+
+            if not is_success and not is_failure:
+                return web.json_response({"ok": True, "status": "ignored"})
+
+            if not is_success:
+                await db.execute("UPDATE pending_orders SET status='FAILED' WHERE id=?", (order_db_id,))
+                await db.commit()
+                return web.json_response({"ok": True, "status": "failed"})
 
             success, item_row = await increment_sale_and_finalize(stock_id, mode)
             if not success:
@@ -812,12 +873,12 @@ async def kashier_webhook(request: web.Request):
             await db.execute("""
                 INSERT INTO sales_history(user_id, stock_id, category, credential, price_paid, mode_sold)
                 VALUES (?, ?, ?, ?, ?, ?)
-            """, (user_id, stock_id, category, item_row[3], amount_cents / 100.0, mode))
+            """, (user_id, stock_id, category, item_row[3], (amount_cents or 0) / 100.0, mode))
             await db.commit()
 
         credential = escape(item_row[3])
         instructions = await get_instruction(category, mode)
-        message_text = f"📩 <b>بيانات الحساب المشتراة:</b>\n<code>{credential}</code>"
+        message_text = f"?? <b>?????? ?????? ????????:</b>\n<code>{credential}</code>"
         if instructions:
             message_text += f"\n\n<pre>{escape(instructions)}</pre>"
         try:
