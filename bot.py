@@ -96,6 +96,18 @@ async def init_db():
             message_text TEXT NOT NULL,
             PRIMARY KEY (category, mode)
         );""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS pending_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id TEXT UNIQUE,
+            user_id INTEGER NOT NULL,
+            category TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            stock_id INTEGER NOT NULL,
+            amount_cents INTEGER NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'EGP',
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );""")
         await db.commit()
     await migrate_db()
 
@@ -142,60 +154,6 @@ def main_menu_kb():
         [InlineKeyboardButton(text="ðŸ›ï¸ Ø§Ù„ÙƒØªØ§Ù„ÙˆØ¬ / Ø´Ø±Ø§Ø¡", callback_data="catalog")],
         [InlineKeyboardButton(text="ðŸ’¼ Ø±ØµÙŠØ¯ÙŠ", callback_data="balance")],
     ])
-
-# ---- users / balances ----
-
-# ==== CONTACT MANAGEMENT ====
-class ContactStates(StatesGroup):
-    waiting_email = State()
-    waiting_phone = State()
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-EG_PHONE_RE = re.compile(r"^\+?20?1[0-25]\d{8}$")
-
-def valid_email(s: str) -> bool:
-    return bool(EMAIL_RE.match(s or ""))
-
-def valid_phone(s: str) -> bool:
-    return bool(EG_PHONE_RE.match(normalize_digits((s or "").strip())))
-
-@dp.message(Command("setcontact"))
-async def setcontact_cmd(m: Message, state: FSMContext):
-    await state.set_state(ContactStates.waiting_email)
-    await m.reply("من فضلك أرسل بريدك الإلكتروني")
-
-@dp.message(StateFilter(ContactStates.waiting_email))
-async def take_email(m: Message, state: FSMContext):
-    email = (m.text or "").strip()
-    if not valid_email(email):
-        await m.reply("صيغة البريد الإلكتروني غير صحيحة.")
-        return
-    await state.update_data(email=email)
-    await state.set_state(ContactStates.waiting_phone)
-    await m.reply("أرسل رقم هاتفك (مثال مصر): 01XXXXXXXXX أو +201XXXXXXXXX")
-
-@dp.message(StateFilter(ContactStates.waiting_phone))
-async def take_phone(m: Message, state: FSMContext):
-    phone = (m.text or "").strip()
-    if not valid_phone(phone):
-        await m.reply("رقم الهاتف غير صحيح. المثال: 01XXXXXXXXX أو +201XXXXXXXXX.")
-        return
-    data = await state.get_data()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET email=?, phone=? WHERE user_id=?", (data["email"], phone, m.from_user.id))
-        await db.commit()
-    await state.clear()
-    await m.reply("تم حفظ بيانات التواصل. الآن يمكنك استخدام /charge")
-
-@dp.message(Command("mycontact"))
-async def mycontact_cmd(m: Message):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT email, phone FROM users WHERE user_id=?", (m.from_user.id,))
-        row = await cur.fetchone()
-        if row:
-            email, phone = row
-            await m.reply(f"Your saved contact info:\nEmail: {email or '-'}\nPhone: {phone or '-'}")
-        else:
-            await m.reply("لا توجد بيانات اتصال محفوظة. استخدم /setcontact")
 
 
 async def get_or_create_user(user_id: int) -> float:
@@ -416,18 +374,6 @@ def parse_stockm_lines(text: str):
         results.append((cat, p_price, p_cap, s_price, s_cap, l_price, l_cap, cred)); ok += 1
     return results, ok, fail
 
-async def add_stock_row_modes(category: str, credential: str,
-                              p_price=None,p_cap=None,
-                              s_price=None,s_cap=None,
-                              l_price=None,l_cap=None):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO stock(category, price, credential,
-                              p_price, p_cap, s_price, s_cap, l_price, l_cap)
-            VALUES (?,?,?,?,?,?,?,?,?)
-        """, (category, 0, credential, p_price, p_cap, s_price, s_cap, l_price, l_cap))
-        await db.commit()
-
 @dp.message(StateFilter(ImportStates.single), F.text)
 async def import_text_single(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id): return
@@ -521,7 +467,7 @@ def page_id_for(category: str, mode: str) -> str | None:
     return KASHIER_PAGES.get(f"{category}:{mode}")
 
 def make_order_id(user_id: int, stock_id: int) -> str:
-    return f"tg-{user_id}-{stock_id}-{time.time_ns()}"
+    return f"tg-{user_id}-{stock_id}-{int(time.time())}"
 
 async def create_pending_and_checkout_url(user_id: int, item_row: tuple, mode: str, price: float) -> str | None:
     page_id = page_id_for(item_row[1], mode)
@@ -878,7 +824,7 @@ async def kashier_webhook(request: web.Request):
 
         credential = escape(item_row[3])
         instructions = await get_instruction(category, mode)
-        message_text = f"?? <b>?????? ?????? ????????:</b>\n<code>{credential}</code>"
+        message_text = f"📩 <b>بيانات الحساب المشتراة:</b>\n<code>{credential}</code>"
         if instructions:
             message_text += f"\n\n<pre>{escape(instructions)}</pre>"
         try:
