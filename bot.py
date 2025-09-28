@@ -94,31 +94,6 @@ async def init_db():
             message_text TEXT NOT NULL,
             PRIMARY KEY (category, mode)
         );""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS payments(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            merchant_order_id TEXT UNIQUE,
-            user_id INTEGER,
-            amount_cents INTEGER,
-            status TEXT,
-            created_at TEXT DEFAULT (DATETIME('now','localtime'))
-        );""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS pending_orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            order_id TEXT UNIQUE,
-            user_id INTEGER NOT NULL,
-            category TEXT NOT NULL,
-            mode TEXT NOT NULL,
-            stock_id INTEGER NOT NULL,
-            amount_cents INTEGER NOT NULL,
-            currency TEXT NOT NULL DEFAULT 'EGP',
-            status TEXT NOT NULL DEFAULT 'PENDING',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );""")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_pending_orders_order ON pending_orders(order_id);")
-
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_stock_category ON stock(category);")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_sales_user ON sales_history(user_id);")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_payments_order ON payments(merchant_order_id);")
         await db.commit()
     await migrate_db()
 
@@ -856,84 +831,16 @@ async def kashier_webhook(request: web.Request):
         print("[KASHIER WEBHOOK ERROR]", e)
         return web.json_response({"ok": False, "error": str(e)}, status=500)
 
-async def mark_payment_paid(merchant_order_id: str) -> bool: # Kept for admin command
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT id, user_id, amount_cents, status FROM payments WHERE merchant_order_id=?", (merchant_order_id,))
-        row = await cur.fetchone()
-        if not row:
-            print("[WEBHOOK] Unknown merchant_order_id:", merchant_order_id)
-            return False
-        pid, user_id, amount_cents, status = row
-        if status == "paid":
-            return True
-        await db.execute("UPDATE payments SET status='paid' WHERE id=?", (pid,))
-        await db.commit()
-    amount = (amount_cents or 0) / 100.0
-    await change_balance(user_id, amount)
-    try:
-        await bot.send_message(user_id, f"تم شحن رصيدك بمبلغ {amount:g} ج.م.")
-    except Exception:
-        pass
-    return True
-
-async def paymob_webhook(request: web.Request):
-    try:
-        if request.content_type == "application/json":
-            data = await request.json()
-        else:
-            post = await request.post()
-            data = {k: v for k, v in post.items()}
-            if "obj" in data and isinstance(data["obj"], str):
-                try:
-                    data["obj"] = json.loads(data["obj"])
-                except Exception:
-                    pass
-        received_hmac = request.query.get("hmac") or data.get("hmac") or ""
-        valid = True
-        if PAYMOB_HMAC_SECRET:
-            valid = verify_paymob_hmac(PAYMOB_HMAC_SECRET, data, received_hmac)
-        if not valid:
-            return web.json_response({"ok": False, "reason": "invalid_hmac"}, status=400)
-
-        obj = data.get("obj") or data
-        success = bool(obj.get("success"))
-        order_info = obj.get("order") or {}
-        merchant_order_id = str(order_info.get("merchant_order_id") or obj.get("merchant_order_id") or "")
-
-        if not merchant_order_id:
-            return web.json_response({"ok": False, "reason": "missing_merchant_order_id"}, status=400)
-
-        if success:
-            ok = await mark_payment_paid(merchant_order_id)
-            return web.json_response({"ok": ok})
-        else:
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("UPDATE payments SET status='failed' WHERE merchant_order_id=? AND status='pending'", (merchant_order_id,))
-                await db.commit()
-            return web.json_response({"ok": True, "status": "failed"})
-    except Exception as e:
-        print("[WEBHOOK ERROR]", e)
-        return web.json_response({"ok": False, "error": str(e)}, status=500)
-
-@dp.message(Command("confirmcharge"))
-async def confirm_cmd(m: Message, command: CommandObject):
-    if not is_admin(m.from_user.id): return
-    merchant_order_id = (command.args or "").strip()
-    if not merchant_order_id:
-        await m.reply("من فضلك استخدم: /confirmcharge <merchant_order_id>"); return
-    ok = await mark_payment_paid(merchant_order_id)
-    await m.reply("تم تأكيد الدفع وتحديث الرصيد." if ok else "تعذر العثور على العملية أو لم تتم.")
-
 # ==================== RUN ====================
 async def run_web_app():
     app = web.Application()
-    path = WEB_BASE_PATH + "/paymob/webhook"
-    app.router.add_post(path, paymob_webhook)
+    path = WEB_BASE_PATH + "/kashier/webhook"
+    app.router.add_post(path, kashier_webhook)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, WEB_HOST, WEB_PORT)
     await site.start()
-    print(f"[WEB] Paymob webhook listening on http://{WEB_HOST}:{WEB_PORT}{path}")
+    print(f"[WEB] Kashier webhook listening on http://{WEB_HOST}:{WEB_PORT}{path}")
 
 async def main():
     await init_db()
