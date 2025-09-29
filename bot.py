@@ -28,7 +28,7 @@ def escape(text: str) -> str:
     return html.escape(text or "")
 
 STOCK = {
-    "مشترك": {"shared":  [{"credential": "shared-user1:pass", "price": 150.0}]},
+    "مشترك": {"shared":  [{"credential": "shared-user1:pass", "price": 10.0}]},
     "فردي":  {"personal":[{"credential": "personal-user1:pass", "price": 250.0}]},
     "لابتوب":{"laptop":  [{"credential": "laptop-key-xxxx", "price": 150.0}]}
 }
