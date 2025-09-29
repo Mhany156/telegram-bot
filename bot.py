@@ -11,12 +11,10 @@ import aiosqlite
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
-# Kashier
 KASHIER_API_KEY = os.getenv("KASHIER_API_KEY", "")
 KASHIER_MERCHANT_ID = os.getenv("KASHIER_MERCHANT_ID", "")
 KASHIER_SECRET = os.getenv("KASHIER_SECRET", "")
 
-# Kashier Payment Pages (من زر Share)
 PP_PERSONAL = os.getenv("KASHIER_PP_PERSONAL", "")
 PP_SHARED  = os.getenv("KASHIER_PP_SHARED", "")
 PP_LAPTOP  = os.getenv("KASHIER_PP_LAPTOP", "")
@@ -24,26 +22,36 @@ PP_LAPTOP  = os.getenv("KASHIER_PP_LAPTOP", "")
 if not TELEGRAM_TOKEN or ":" not in TELEGRAM_TOKEN:
     raise RuntimeError("Missing/invalid TELEGRAM_TOKEN in environment.")
 
-# Aiogram 3.7+: لازم DefaultBotProperties بدلاً من parse_mode داخل الـ initializer
 bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 flask_app = Flask(__name__)
-BOT_LOOP = None  # هنخزّن اللوب الرئيسي عشان نستدعيه من Flask thread
+BOT_LOOP = None
 
 def escape(t: str) -> str:
     return html.escape(t or "")
 
-# ==================== DB ====================
+# ==================== DB / MIGRATION ====================
 DB_PATH = "store.db"
 
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""CREATE TABLE IF NOT EXISTS users(
-            user_id INTEGER PRIMARY KEY,
-            balance REAL DEFAULT 0
-        );""")
-        # كل صف = كريدنشال لنمط واحد مع سعة cap وعدّاد sold
-        await db.execute("""CREATE TABLE IF NOT EXISTS stock(
+async def _table_columns(db, table: str):
+    try:
+        cur = await db.execute(f"PRAGMA table_info({table});")
+        rows = await cur.fetchall()
+        return [r[1] for r in rows]  # name column
+    except Exception:
+        return []
+
+async def _migrate_old_stock_schema(db):
+    cols = await _table_columns(db, "stock")
+    if not cols:
+        return  # لا يوجد جدول قديم
+    # لو بالفعل مخطط V2 موجود (cap/sold/chosen_mode) لا حاجة للهجرة
+    if {"cap", "sold", "chosen_mode"}.issubset(set(cols)):
+        return
+
+    # إنشاء جدول جديد بالمخطط الحديث
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS stock_v2(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             category TEXT NOT NULL,
             credential TEXT NOT NULL,
@@ -52,6 +60,108 @@ async def init_db():
             cap INTEGER NOT NULL DEFAULT 1,
             sold INTEGER NOT NULL DEFAULT 0,
             is_sold INTEGER NOT NULL DEFAULT 0
+        );
+    """)
+
+    # محاولة توسعة البيانات من الجدول القديم إن وُجدت أعمدة p_/s_/l_
+    has_p = "p_price" in cols or "p_cap" in cols or "p_sold" in cols
+    has_s = "s_price" in cols or "s_cap" in cols or "s_sold" in cols
+    has_l = "l_price" in cols or "l_cap" in cols or "l_sold" in cols
+    try:
+        cur = await db.execute(f"SELECT * FROM stock;")
+        old_rows = await cur.fetchall()
+        # حضّر فهارس للأعمدة بالاسم
+        name_to_idx = {name: idx for idx, name in enumerate(cols)}
+        async def get(row, name, default=None):
+            idx = name_to_idx.get(name)
+            if idx is None: return default
+            return row[idx] if row[idx] is not None else default
+
+        for row in old_rows:
+            category = str(get(row, "category", "") or "")
+            credential = str(get(row, "credential", "") or "")
+            base_price = get(row, "price", 0.0) or 0.0
+            # chosen_mode القديم (لو موجود) نعامله كصف personal واحد
+            chosen_old = get(row, "chosen_mode")
+            inserted = False
+            if chosen_old in ("personal","shared","laptop"):
+                mode = chosen_old
+                cap = 3 if mode=="shared" else 1
+                sold = 0
+                price = base_price or 0.0
+                await db.execute(
+                    "INSERT INTO stock_v2(category,credential,chosen_mode,price,cap,sold,is_sold) VALUES(?,?,?,?,?,?,0)",
+                    (category, credential, mode, price, cap, sold)
+                )
+                inserted = True
+
+            # لو عندنا أعمدة متعددة، وسّع لصفوف
+            if has_p:
+                price = get(row, "p_price", None)
+                cap   = get(row, "p_cap", 1) or 1
+                sold  = get(row, "p_sold", 0) or 0
+                if price is not None:
+                    is_sold = 1 if (sold >= cap) else 0
+                    await db.execute(
+                        "INSERT INTO stock_v2(category,credential,chosen_mode,price,cap,sold,is_sold) VALUES(?,?,?,?,?,?,?)",
+                        (category, credential, "personal", float(price), int(cap), int(sold), is_sold)
+                    )
+                    inserted = True
+            if has_s:
+                price = get(row, "s_price", None)
+                cap   = get(row, "s_cap", 3) or 3
+                sold  = get(row, "s_sold", 0) or 0
+                if price is not None:
+                    is_sold = 1 if (sold >= cap) else 0
+                    await db.execute(
+                        "INSERT INTO stock_v2(category,credential,chosen_mode,price,cap,sold,is_sold) VALUES(?,?,?,?,?,?,?)",
+                        (category, credential, "shared", float(price), int(cap), int(sold), is_sold)
+                    )
+                    inserted = True
+            if has_l:
+                price = get(row, "l_price", None)
+                cap   = get(row, "l_cap", 1) or 1
+                sold  = get(row, "l_sold", 0) or 0
+                if price is not None:
+                    is_sold = 1 if (sold >= cap) else 0
+                    await db.execute(
+                        "INSERT INTO stock_v2(category,credential,chosen_mode,price,cap,sold,is_sold) VALUES(?,?,?,?,?,?,?)",
+                        (category, credential, "laptop", float(price), int(cap), int(sold), is_sold)
+                    )
+                    inserted = True
+
+            # لو ولا حالة من دول اتحققت، أنقل صف واحد كـ personal افتراضي
+            if not inserted and credential:
+                await db.execute(
+                    "INSERT INTO stock_v2(category,credential,chosen_mode,price,cap,sold,is_sold) VALUES(?,?,?,?,?,0,0)",
+                    (category, credential, "personal", float(base_price or 0.0), 1)
+                )
+        # استبدال الجدول
+        await db.execute("DROP TABLE IF EXISTS stock;")
+        await db.execute("ALTER TABLE stock_v2 RENAME TO stock;")
+        await db.commit()
+    except Exception:
+        # لو حصل فشل في النقل لأي سبب، نحذف القديم وننشئ مخطط حديث فاضي
+        await db.execute("DROP TABLE IF EXISTS stock;")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS stock(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                credential TEXT NOT NULL,
+                chosen_mode TEXT CHECK(chosen_mode IN ('personal','shared','laptop')) NOT NULL,
+                price REAL NOT NULL DEFAULT 0,
+                cap INTEGER NOT NULL DEFAULT 1,
+                sold INTEGER NOT NULL DEFAULT 0,
+                is_sold INTEGER NOT NULL DEFAULT 0
+            );
+        """)
+        await db.commit()
+
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""CREATE TABLE IF NOT EXISTS users(
+            user_id INTEGER PRIMARY KEY,
+            balance REAL DEFAULT 0
         );""")
         await db.execute("""CREATE TABLE IF NOT EXISTS sales_history(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,6 +179,9 @@ async def init_db():
             message_text TEXT NOT NULL,
             PRIMARY KEY (category, mode)
         );""")
+        # تأكد من وجود جدول stock بالمخطط الحديث أو نفّذ هجرة
+        await _migrate_old_stock_schema(db)
+        # اضبط is_sold بناءً على cap/sold
         await db.execute("UPDATE stock SET is_sold=1 WHERE sold>=cap;")
         await db.commit()
 
@@ -106,7 +219,7 @@ async def add_stock_item_mode(category: str, mode: str, price: float, credential
     if mode not in ("personal", "shared", "laptop"):
         raise ValueError("Invalid mode")
     if mode == "shared" and (cap is None or cap <= 0):
-        cap = 3  # shared يتباع 3 مرات
+        cap = 3
     if cap is None or cap <= 0:
         cap = 1
     async with aiosqlite.connect(DB_PATH) as db:
@@ -414,7 +527,7 @@ def kashier_callback():
         status = str(payload.get("status", "")).lower()
         ref = payload.get("reference") or payload.get("orderReference") or payload.get("merchantOrderId") or payload.get("ref")
         if status != "paid" or not ref or not str(ref).startswith("buy-"): return ("", 200)
-        parts = str(ref).split("-", 4)  # ["buy", uid, cat, mode, ts]
+        parts = str(ref).split("-", 4)
         if len(parts) < 5: return ("", 200)
         user_id = int(parts[1]); category = parts[2].replace("_", " "); mode = parts[3]
 
@@ -430,11 +543,9 @@ def kashier_callback():
             if instructions: msg += f"\n\n{instructions}"
             await bot.send_message(user_id, msg)
 
-        # نفذ على لوب البوت الرئيسي
         if BOT_LOOP and BOT_LOOP.is_running():
             asyncio.run_coroutine_threadsafe(finalize(), BOT_LOOP)
         else:
-            # fallback (نادرًا): نفّذ مباشرة (قد ينشئ لوب مؤقت)
             asyncio.run(finalize())
         return ("", 200)
     except Exception as e:
@@ -448,10 +559,7 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    # شغّل Flask في Thread منفصل
     def run_flask():
         flask_app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
     threading.Thread(target=run_flask, daemon=True).start()
-
-    # شغّل البوت على اللوب الرئيسي
     asyncio.run(main())
