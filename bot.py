@@ -26,8 +26,7 @@ bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMod
 dp = Dispatcher()
 flask_app = Flask(__name__)
 
-def escape(t:str) -> str:
-    return html.escape(t or "")
+def escape(t:str)->str: return html.escape(t or "")
 
 # ==================== DB ====================
 DB_PATH = "store.db"
@@ -38,7 +37,7 @@ async def init_db():
             user_id INTEGER PRIMARY KEY,
             balance REAL DEFAULT 0
         );""")
-        # كل صف يمثل كريدنشال لنمط واحد (chosen_mode) وله سعة(cap) ومبيعات(sold)
+        # كل صف = كريدنشال لنمط واحد (personal/shared/laptop) مع سعة (cap) وعدّاد (sold)
         await db.execute("""CREATE TABLE IF NOT EXISTS stock(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             category TEXT NOT NULL,
@@ -65,8 +64,7 @@ async def init_db():
             message_text TEXT NOT NULL,
             PRIMARY KEY (category, mode)
         );""")
-        # ترقية قديمة (لو جدول stock القديم موجود) نحاول نقل/تكييف بسيط:
-        await db.execute("""UPDATE stock SET is_sold=1 WHERE sold>=cap;""")
+        await db.execute("UPDATE stock SET is_sold=1 WHERE sold>=cap;")
         await db.commit()
 
 # ==================== HELPERS ====================
@@ -94,14 +92,11 @@ async def get_or_create_user(uid:int)->float:
         return 0.0
 
 # ==================== STOCK CORE ====================
-async def add_stock_item_mode(category:str, mode:str, price:float, credential:str, cap:int):
-    """يضيف عنصر لمود محدد مع سعة cap (shared=3 تلقائيًا إن لزم)"""
+async def add_stock_item_mode(category:str, mode:str, price:float, credential:str, cap:int|None):
     if mode not in ("personal","shared","laptop"):
         raise ValueError("Invalid mode")
-    if mode == "shared" and (cap is None or cap <= 0):
-        cap = 3
-    if cap is None or cap <= 0:
-        cap = 1
+    if mode=="shared" and (cap is None or cap<=0): cap = 3
+    if cap is None or cap<=0: cap = 1
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO stock(category,credential,chosen_mode,price,cap,sold,is_sold) VALUES(?,?,?,?,?,0,0)",
@@ -110,17 +105,28 @@ async def add_stock_item_mode(category:str, mode:str, price:float, credential:st
         await db.commit()
 
 async def list_categories_with_availability():
-    """يرجع عدد العناصر المتاحة فعليًا (sold < cap و is_sold=0) لكل فئة"""
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("""
             SELECT category, COUNT(*)
             FROM stock
-            WHERE is_sold=0 AND sold < cap
+            WHERE is_sold=0 AND sold<cap
             GROUP BY category
+            ORDER BY category
         """)
         return await cur.fetchall()
 
-async def list_stock_items(category:str, limit:int=30):
+async def modes_availability_for(category:str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            SELECT chosen_mode, COUNT(*)
+            FROM stock
+            WHERE category=? AND is_sold=0 AND sold<cap
+            GROUP BY chosen_mode
+        """,(category,))
+        rows = await cur.fetchall()
+        return {m:c for m,c in rows}
+
+async def list_stock_items(category:str, limit:int=50):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("""
             SELECT id, chosen_mode, price, cap, sold, credential
@@ -135,18 +141,15 @@ async def clear_stock_category(category:str)->int:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("DELETE FROM stock WHERE category=?", (category,))
         n = cur.rowcount or 0
-        await db.commit()
-        return n
+        await db.commit(); return n
 
 async def delete_stock_item(stock_id:int)->int:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("DELETE FROM stock WHERE id=?", (stock_id,))
         n = cur.rowcount or 0
-        await db.commit()
-        return n
+        await db.commit(); return n
 
 async def find_item_with_mode(category:str, mode:str):
-    """يرجع صف متاح لهذا المود (sold<cap)."""
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("""
             SELECT id, credential, price, cap, sold
@@ -157,13 +160,11 @@ async def find_item_with_mode(category:str, mode:str):
         """,(category, mode))
         return await cur.fetchone()
 
-async def increment_sale_and_finalize(stock_id:int, mode:str)->bool:
-    """يزوّد sold بمقدار 1 ويقفل الصف لو وصل cap."""
+async def increment_sale_and_finalize(stock_id:int)->None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE stock SET sold=sold+1 WHERE id=?", (stock_id,))
         await db.execute("UPDATE stock SET is_sold=1 WHERE id=? AND sold>=cap", (stock_id,))
         await db.commit()
-        return True
 
 async def log_sale(user_id:int, stock_id:int, category:str, credential:str, price:float, mode:str):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -205,21 +206,23 @@ async def stock_cmd(m:Message):
     rows = await list_categories_with_availability()
     if not rows:
         await m.reply("لا يوجد مخزون متاح."); return
-    lines = ["المخزون المتاح (غير مكتمل السعة):"]
-    for cat, cnt in rows:
-        lines.append(f"- {cat}: {cnt} عنصر")
+    lines = ["المخزون المتاح:"]
+    for cat, cnt in rows: lines.append(f"- {cat}: {cnt} عنصر")
     await m.reply("\n".join(lines))
 
 @dp.message(Command("liststock"))
 @admin_only
 async def liststock_cmd(m:Message, command:CommandObject):
     if not command.args:
-        await m.reply("الاستخدام: /liststock <category>"); return
+        cats = await list_categories_with_availability()
+        if not cats: await m.reply("لا يوجد مخزون."); return
+        await m.reply("استخدم: /liststock <category>\nالفئات المتاحة:\n- " + "\n- ".join(c for c,_ in cats))
+        return
     cat = command.args.strip()
     rows = await list_stock_items(cat, 100)
     if not rows:
-        await m.reply("لا يوجد عناصر."); return
-    lines = [f"أول {len(rows)} عنصر ({cat}):"]
+        await m.reply("لا يوجد عناصر لهذه الفئة."); return
+    lines = [f"({cat}) العناصر المتاحة:"]
     for sid, mode, price, cap, sold, cred in rows:
         lines.append(f"ID={sid} | mode={mode} | {price}ج | {sold}/{cap} | {cred}")
     await m.reply("\n".join(lines))
@@ -227,16 +230,14 @@ async def liststock_cmd(m:Message, command:CommandObject):
 @dp.message(Command("clearstock"))
 @admin_only
 async def clearstock_cmd(m:Message, command:CommandObject):
-    if not command.args:
-        await m.reply("الاستخدام: /clearstock <category>"); return
+    if not command.args: await m.reply("الاستخدام: /clearstock <category>"); return
     n = await clear_stock_category(command.args.strip())
     await m.reply(f"🧹 تم حذف {n} عنصر.")
 
 @dp.message(Command("delstock"))
 @admin_only
 async def delstock_cmd(m:Message, command:CommandObject):
-    if not command.args:
-        await m.reply("الاستخدام: /delstock <stock_id>"); return
+    if not command.args: await m.reply("الاستخدام: /delstock <stock_id>"); return
     sid = parse_int_loose(command.args)
     if not sid: await m.reply("ID غير صالح"); return
     n = await delete_stock_item(sid)
@@ -250,9 +251,9 @@ ADMIN_IMPORT_STATE = {}  # {uid: {"mode":"simple"|"multi"}}
 async def importstock_cmd(m:Message):
     ADMIN_IMPORT_STATE[m.from_user.id] = {"mode":"simple"}
     await m.reply(
-        "📥 أرسل ملف TXT أو الصق سطور بالشكل (سطر لكل منتج):\n"
+        "📥 أرسل ملف TXT أو الصق سطور بهذا الشكل:\n"
         "<category> <price> <credential>\n"
-        "— يتم إدراجها كنمط personal بسعة 1 تلقائيًا."
+        "— يتم تخزينها كنمط personal بسعة 1."
     )
 
 @dp.message(Command("importstockm"))
@@ -260,10 +261,10 @@ async def importstock_cmd(m:Message):
 async def importstockm_cmd(m:Message):
     ADMIN_IMPORT_STATE[m.from_user.id] = {"mode":"multi"}
     await m.reply(
-        "📥 أرسل ملف TXT أو الصق سطور بالشكل (سطر لكل منتج):\n"
+        "📥 أرسل ملف TXT أو الصق سطور بهذا الشكل:\n"
         "<category> <mode> <price> <credential>\n"
         "المودات: personal | shared | laptop\n"
-        "— shared يتم تعيين سعتها cap=3 تلقائيًا."
+        "— shared سعتها cap=3 تلقائيًا."
     )
 
 @dp.message(F.document)
@@ -309,34 +310,40 @@ async def _process_import_text(m:Message, text:str, mode_flag:str):
                 price = parse_float_loose(parts[2]); cred = parts[3]
                 if mode not in ("personal","shared","laptop"): bad+=1; continue
                 if price is None: bad+=1; continue
-                default_cap = 3 if mode=="shared" else 1
-                await add_stock_item_mode(cat, mode, price, cred, cap=default_cap)
+                cap = 3 if mode=="shared" else 1
+                await add_stock_item_mode(cat, mode, price, cred, cap)
                 ok+=1
         except Exception:
             bad+=1
     await m.reply(f"✅ تم استيراد: {ok} عنصر.\n❌ فشل: {bad} سطر.")
 
 # ==================== CATALOG / PAYMENT ====================
+PRETTY = {"personal":"فردي","shared":"مشترك","laptop":"لابتوب"}
+
 @dp.callback_query(F.data=="catalog")
 async def cb_catalog(c:CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👥 مشترك", callback_data="cat::مشترك")],
-        [InlineKeyboardButton(text="👤 فردي",  callback_data="cat::فردي")],
-        [InlineKeyboardButton(text="💻 لابتوب", callback_data="cat::لابتوب")],
-    ])
-    await c.message.edit_text("اختر الفئة:", reply_markup=kb)
+    cats = await list_categories_with_availability()
+    if not cats:
+        await c.message.edit_text("لا يوجد مخزون حالياً.")
+        return
+    rows = []
+    for cat, cnt in cats:
+        rows.append([InlineKeyboardButton(text=f"{cat} ({cnt})", callback_data=f"cat::{cat}")])
+    rows.append([InlineKeyboardButton(text="🔄 تحديث", callback_data="catalog")])
+    await c.message.edit_text("اختر الفئة:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 @dp.callback_query(F.data.startswith("cat::"))
 async def cb_category(c:CallbackQuery):
     _, category = c.data.split("::",1)
-    # نعرض ثلاثة أزرار؛ التحقق الفعلي يتم في الخطوة التالية
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 ادفع (مشترك)", callback_data=f"mode::{category}::shared")],
-        [InlineKeyboardButton(text="💳 ادفع (فردي)",   callback_data=f"mode::{category}::personal")],
-        [InlineKeyboardButton(text="💳 ادفع (لابتوب)", callback_data=f"mode::{category}::laptop")],
-        [InlineKeyboardButton(text="🔙 رجوع", callback_data="catalog")]
-    ])
-    await c.message.edit_text(f"الفئة: {category}\nاختر النمط:", reply_markup=kb)
+    av = await modes_availability_for(category)
+    buttons = []
+    for mode in ("shared","personal","laptop"):
+        if av.get(mode):
+            buttons.append([InlineKeyboardButton(text=f"💳 ادفع ({PRETTY[mode]})", callback_data=f"mode::{category}::{mode}")])
+    if not buttons:
+        await c.answer("لا يوجد عناصر لهذه الفئة الآن.", show_alert=True); return
+    buttons.append([InlineKeyboardButton(text="🔙 رجوع", callback_data="catalog")])
+    await c.message.edit_text(f"الفئة: {category}\nاختر النمط:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 @dp.callback_query(F.data.startswith("mode::"))
 async def cb_pick_mode(c:CallbackQuery):
@@ -353,14 +360,13 @@ async def cb_pick_mode(c:CallbackQuery):
         await c.answer("صفحة الدفع غير مجهزة.", show_alert=True); return
     sep = "&" if "?" in base_url else "?"
     pay_url = f"{base_url}{sep}ref={merchant_order_id}"
-    pretty = {"personal":"فردي","shared":"مشترك","laptop":"لابتوب"}[mode]
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"💳 ادفع {price:.2f} ج.م", url=pay_url)],
         [InlineKeyboardButton(text="🔙 رجوع", callback_data=f"cat::{category}")]
     ])
     await c.message.edit_text(
-        f"الفئة: {escape(category)}\nالنمط: {pretty}\nالسعر: {price:.2f} ج.م\n"
-        f"السعة: {sold}/{cap} مستخدم. عند الدفع سيتم حجز مقعد لك.",
+        f"الفئة: {escape(category)}\nالنمط: {PRETTY.get(mode,mode)}\nالسعر: {price:.2f} ج.م\n"
+        f"السعة الحالية: {sold}/{cap}",
         reply_markup=kb
     )
 
@@ -389,11 +395,10 @@ def kashier_callback():
             if not row:
                 await bot.send_message(user_id, "⚠️ تمت عملية الدفع لكن العنصر غير متاح حالياً."); return
             stock_id, credential, price, cap, sold = row
-            await increment_sale_and_finalize(stock_id, mode)
+            await increment_sale_and_finalize(stock_id)
             await log_sale(user_id, stock_id, category, credential, price, mode)
             instructions = await get_instruction(category, mode) or ""
-            pretty = {"personal":"فردي","shared":"مشترك","laptop":"لابتوب"}.get(mode, mode)
-            msg = f"✅ تم الدفع.\n\n📦 <b>{escape(category)} — {escape(pretty)}</b>\n📩 <b>بياناتك:</b>\n<code>{escape(credential)}</code>"
+            msg = f"✅ تم الدفع.\n\n📦 <b>{escape(category)} — {escape(PRETTY.get(mode,mode))}</b>\n📩 <b>بياناتك:</b>\n<code>{escape(credential)}</code>"
             if instructions: msg += f"\n\n{instructions}"
             await bot.send_message(user_id, msg)
         asyncio.run_coroutine_threadsafe(finalize(), dp.loop)
