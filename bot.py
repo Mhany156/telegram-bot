@@ -7,37 +7,26 @@ from aiogram.client.default import DefaultBotProperties
 from flask import Flask, request, abort
 import aiosqlite
 
-# ==================== ENV ====================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
-
 KASHIER_API_KEY = os.getenv("KASHIER_API_KEY", "")
 KASHIER_MERCHANT_ID = os.getenv("KASHIER_MERCHANT_ID", "")
 KASHIER_SECRET = os.getenv("KASHIER_SECRET", "")
-
 PP_PERSONAL = os.getenv("KASHIER_PP_PERSONAL", "")
 PP_SHARED  = os.getenv("KASHIER_PP_SHARED", "")
 PP_LAPTOP  = os.getenv("KASHIER_PP_LAPTOP", "")
-
 if not TELEGRAM_TOKEN or ":" not in TELEGRAM_TOKEN:
     raise RuntimeError("Missing/invalid TELEGRAM_TOKEN in environment.")
-
 bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 flask_app = Flask(__name__)
-
 def escape(text: str) -> str:
     return html.escape(text or "")
-
-# ==================== DB ====================
 DB_PATH = "store.db"
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""CREATE TABLE IF NOT EXISTS users(
-            user_id INTEGER PRIMARY KEY,
-            balance REAL DEFAULT 0
-        );""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY,balance REAL DEFAULT 0);""")
         await db.execute("""CREATE TABLE IF NOT EXISTS stock(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             category TEXT NOT NULL,
@@ -67,26 +56,21 @@ async def init_db():
         );""")
         await db.commit()
 
-# ==================== HELPERS ====================
 def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
-
 def normalize_digits(s: str) -> str:
     return s.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
-
 def parse_float_loose(s: str):
     if not s: return None
     s = normalize_digits(s).replace(",", ".")
     m = re.search(r'[-+]?\d+(?:\.\d+)?', s)
     return float(m.group(0)) if m else None
-
 def parse_int_loose(s: str):
     if not s: return None
     s = normalize_digits(s)
     m = re.search(r'\d{1,12}', s)
     return int(m.group(0)) if m else None
 
-# ==================== USERS ====================
 async def get_or_create_user(user_id: int) -> float:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
@@ -95,66 +79,54 @@ async def get_or_create_user(user_id: int) -> float:
         await db.execute("INSERT INTO users(user_id,balance) VALUES(?,0)", (user_id,))
         await db.commit()
         return 0.0
-
 async def change_balance(user_id: int, delta: float):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT OR IGNORE INTO users(user_id,balance) VALUES(?,0)", (user_id,))
         await db.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (delta,user_id))
         await db.commit()
 
-# ==================== STOCK ====================
 async def add_stock_item(category:str, price:float, credential:str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT INTO stock(category,price,credential) VALUES(?,?,?)",(category,price,credential))
         await db.commit()
-
 async def list_categories():
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT category, COUNT(*) FROM stock WHERE is_sold=0 GROUP BY category")
         return await cur.fetchall()
-
 async def list_stock_items(category:str, limit:int=20):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT id,price,credential,p_price,s_price,l_price FROM stock WHERE category=? AND is_sold=0 LIMIT ?",(category,limit))
         return await cur.fetchall()
-
 async def clear_stock_category(category:str):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("DELETE FROM stock WHERE category=?", (category,))
         count = cur.rowcount
         await db.commit()
         return count
-
 async def delete_stock_item(stock_id:int):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("DELETE FROM stock WHERE id=?", (stock_id,))
         count = cur.rowcount
         await db.commit()
         return count
-
 async def find_item_with_mode(category, mode):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT id,credential,price FROM stock WHERE category=? AND is_sold=0 LIMIT 1",(category,))
-        row = await cur.fetchone()
-        return row
-
+        return await cur.fetchone()
 async def mark_item_sold(stock_id:int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE stock SET is_sold=1 WHERE id=?",(stock_id,))
         await db.commit()
-
 async def log_sale(user_id:int, stock_id:int, category:str, credential:str, price:float, mode:str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT INTO sales_history(user_id,stock_id,category,credential,price_paid,mode_sold) VALUES(?,?,?,?,?,?)",(user_id,stock_id,category,credential,price,mode))
         await db.commit()
-
 async def get_instruction(category, mode):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT message_text FROM instructions WHERE category=? AND mode=?",(category,mode))
         row = await cur.fetchone()
         return row[0] if row else None
 
-# ==================== COMMANDS (USER) ====================
 @dp.message(Command("start"))
 async def cmd_start(m:Message):
     await get_or_create_user(m.from_user.id)
@@ -167,41 +139,34 @@ async def cmd_start(m:Message):
 @dp.message(Command("whoami"))
 async def cmd_whoami(m:Message):
     await m.reply(f"👤 ID: {m.from_user.id}\nName: {m.from_user.full_name}")
-
 @dp.message(Command("balance"))
 async def cmd_balance(m:Message):
     bal = await get_or_create_user(m.from_user.id)
     await m.reply(f"💼 رصيدك الحالي: {bal:.2f} ج.م")
 
-# ==================== COMMANDS (ADMIN) ====================
 @dp.message(Command("stock"))
 async def stock_cmd(m:Message):
     if not is_admin(m.from_user.id): return
     rows = await list_categories()
-    if not rows:
-        await m.reply("لا يوجد مخزون."); return
-    lines = ["المخزون الحالي:"]
-    lines += [f"- {cat}: {cnt} عنصر" for cat,cnt in rows]
+    if not rows: await m.reply("لا يوجد مخزون."); return
+    lines = ["المخزون الحالي:"] + [f"- {cat}: {cnt} عنصر" for cat,cnt in rows]
     await m.reply("\n".join(lines))
-
 @dp.message(Command("liststock"))
 async def liststock_cmd(m:Message, command:CommandObject):
     if not is_admin(m.from_user.id): return
     if not command.args: await m.reply("⚠️ الاستخدام: /liststock <category>"); return
-    rows = await list_stock_items(command.args.strip(),20)
+    rows = await list_stock_items(command.args.strip(),50)
     if not rows: await m.reply("لا يوجد عناصر."); return
     lines = [f"أول {len(rows)} عنصر:"]
     for sid,price,cred,p_p,s_p,l_p in rows:
         lines.append(f"ID={sid} | {price} | {cred}")
     await m.reply("\n".join(lines))
-
 @dp.message(Command("clearstock"))
 async def clearstock_cmd(m:Message, command:CommandObject):
     if not is_admin(m.from_user.id): return
     if not command.args: await m.reply("⚠️ الاستخدام: /clearstock <category>"); return
     count = await clear_stock_category(command.args.strip())
     await m.reply(f"🧹 تم حذف {count} عنصر.")
-
 @dp.message(Command("delstock"))
 async def delstock_cmd(m:Message, command:CommandObject):
     if not is_admin(m.from_user.id): return
@@ -211,7 +176,73 @@ async def delstock_cmd(m:Message, command:CommandObject):
     count = await delete_stock_item(stock_id)
     await m.reply(f"🗑️ تم حذف {count} عنصر.")
 
-# ==================== CATALOG ====================
+# ---- استيراد المخزون ----
+ADMIN_IMPORT_STATE = {}  # {user_id: {"mode":"simple"|"multi"}}
+
+@dp.message(Command("importstock"))
+async def importstock_cmd(m:Message):
+    if not is_admin(m.from_user.id): return
+    ADMIN_IMPORT_STATE[m.from_user.id] = {"mode":"simple"}
+    await m.reply("📥 أرسل ملف TXT أو الصق سطور بهذا الشكل (سطر لكل منتج):\n<category> <price> <credential>\nمثال:\nمشترك 250 user:pass\nفردي 250 user2:pass2\nلابتوب 350 key-xxxx")
+
+@dp.message(Command("importstockm"))
+async def importstockm_cmd(m:Message):
+    if not is_admin(m.from_user.id): return
+    ADMIN_IMPORT_STATE[m.from_user.id] = {"mode":"multi"}
+    await m.reply("📥 أرسل ملف TXT أو الصق سطور بهذا الشكل (سطر لكل منتج):\n<category> <mode> <price> <credential>\nالمودات: personal | shared | laptop\nمثال:\nCapCut personal 250 user:pass\nCapCut shared 250 shared-user:pass\nCapCut laptop 350 key-xxxx")
+
+@dp.message(F.document)
+async def handle_import_file(m:Message):
+    if not is_admin(m.from_user.id): return
+    st = ADMIN_IMPORT_STATE.get(m.from_user.id)
+    if not st: return
+    try:
+        file = await bot.get_file(m.document.file_id)
+        from io import BytesIO
+        buf = BytesIO()
+        await bot.download(file, buf)
+        text = buf.getvalue().decode("utf-8","ignore")
+    except Exception as e:
+        return await m.reply(f"❌ فشل تنزيل الملف: {e}")
+    await _process_import_text(m, text, st["mode"])
+    ADMIN_IMPORT_STATE.pop(m.from_user.id, None)
+
+@dp.message()
+async def handle_import_text(m:Message):
+    if not is_admin(m.from_user.id): return
+    st = ADMIN_IMPORT_STATE.get(m.from_user.id)
+    if not st: return
+    if m.text:
+        await _process_import_text(m, m.text, st["mode"])
+        ADMIN_IMPORT_STATE.pop(m.from_user.id, None)
+
+async def _process_import_text(m:Message, text:str, mode:str):
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    ok, bad = 0, 0
+    for ln in lines:
+        try:
+            if mode=="simple":
+                parts = ln.split(maxsplit=2)
+                if len(parts)<3: bad+=1; continue
+                cat = parts[0]
+                price = parse_float_loose(parts[1])
+                cred = parts[2]
+            else:  # multi
+                parts = ln.split(maxsplit=3)
+                if len(parts)<4: bad+=1; continue
+                cat = parts[0]
+                the_mode = parts[1].lower()
+                if the_mode not in {"personal","shared","laptop"}: bad+=1; continue
+                price = parse_float_loose(parts[2])
+                cred = parts[3]
+                # نخزن نفس الـ category وسعر عام = price (التمييز بالنمط عند البيع)
+            if price is None: bad+=1; continue
+            await add_stock_item(cat, price, cred)
+            ok+=1
+        except Exception:
+            bad+=1
+    await m.reply(f"✅ تم استيراد: {ok} عنصر.\n❌ فشل: {bad} سطر.")
+
 @dp.callback_query(F.data=="catalog")
 async def cb_catalog(c:CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -227,10 +258,12 @@ async def cb_category(c:CallbackQuery):
     rows = await list_stock_items(category,1)
     if not rows: return await c.answer("لا يوجد عناصر.", show_alert=True)
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 ادفع", callback_data=f"mode::{category}::personal")],
+        [InlineKeyboardButton(text="💳 ادفع (فردي)", callback_data=f"mode::{category}::personal")],
+        [InlineKeyboardButton(text="💳 ادفع (مشترك)", callback_data=f"mode::{category}::shared")],
+        [InlineKeyboardButton(text="💳 ادفع (لابتوب)", callback_data=f"mode::{category}::laptop")],
         [InlineKeyboardButton(text="🔙 رجوع", callback_data="catalog")]
     ])
-    await c.message.edit_text(f"الفئة {category}، اختر نوع الدفع:", reply_markup=kb)
+    await c.message.edit_text(f"الفئة: {category}\nاختر النمط:", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("mode::"))
 async def cb_pick_mode(c:CallbackQuery):
@@ -251,9 +284,8 @@ async def cb_pick_mode(c:CallbackQuery):
         [InlineKeyboardButton(text=f"💳 ادفع {price:.2f} ج.م", url=pay_url)],
         [InlineKeyboardButton(text="🔙 رجوع", callback_data=f"cat::{category}")]
     ])
-    await c.message.edit_text(f"الفئة: {category}\nالسعر: {price:.2f} ج.م", reply_markup=kb)
+    await c.message.edit_text(f"الفئة: {category}\nالنمط: {mode}\nالسعر: {price:.2f} ج.م", reply_markup=kb)
 
-# ==================== KASHIER CALLBACK ====================
 def _kashier_verify_signature(raw:bytes, sig:str)->bool:
     api_key = (KASHIER_API_KEY or "").encode()
     if not api_key or not sig: return False
@@ -290,7 +322,6 @@ def kashier_callback():
     except Exception as e:
         print("[KASHIER CALLBACK ERROR]",e); return abort(500)
 
-# ==================== RUN ====================
 if __name__=="__main__":
     asyncio.get_event_loop().run_until_complete(init_db())
     def run_flask():
