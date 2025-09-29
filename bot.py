@@ -6,21 +6,21 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.client.default import DefaultBotProperties
 from flask import Flask, request, abort
-import aiosqlite
+import aiosqlite, aiohttp
 
 # ==================== ENV ====================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
-KASHIER_API_KEY    = os.getenv("KASHIER_API_KEY", "")
-KASHIER_MERCHANT_ID= os.getenv("KASHIER_MERCHANT_ID", "")
-KASHIER_SECRET     = os.getenv("KASHIER_SECRET", "")
+KASHIER_API_KEY     = os.getenv("KASHIER_API_KEY", "")
+KASHIER_MERCHANT_ID = os.getenv("KASHIER_MERCHANT_ID", "")
+KASHIER_SECRET      = os.getenv("KASHIER_SECRET", "")
 
 PP_PERSONAL = os.getenv("KASHIER_PP_PERSONAL", "")
 PP_SHARED   = os.getenv("KASHIER_PP_SHARED", "")
 PP_LAPTOP   = os.getenv("KASHIER_PP_LAPTOP", "")
 
-# سر بسيط لتوقيع ال Deep-Link (لو مش موجود هنستخدم سر كاشير)
+# سر لتوقيع ديب لينك (مش كافي لوحده؛ بنستخدمه مع تحقق API)
 DEEPLINK_SECRET = os.getenv("DEEPLINK_SECRET", (KASHIER_SECRET or "changeme"))
 
 if not TELEGRAM_TOKEN or ":" not in TELEGRAM_TOKEN:
@@ -167,6 +167,56 @@ def parse_int_loose(s: str):
     m = re.search(r'\d{1,12}', s)
     return int(m.group(0)) if m else None
 
+# ==================== كاشير: تحقق الدفع عبر API ====================
+_ALLOWED_OK = {"paid", "success", "approved", "captured", "completed", "succeeded"}
+
+def _json_has_paid(data):
+    if isinstance(data, dict):
+        for k,v in data.items():
+            if isinstance(k,str) and k.lower() in ("status","paymentstatus","state","result"):
+                try:
+                    if str(v).lower() in _ALLOWED_OK: return True
+                except Exception:
+                    pass
+            if _json_has_paid(v): return True
+    elif isinstance(data, list):
+        for it in data:
+            if _json_has_paid(it): return True
+    return False
+
+async def kashier_verify_paid(merchant_order_id: str) -> bool:
+    """نحاول نسأل أكثر من إندبوينت لحد ما نلاقي حالة SUCCESS/PAID."""
+    headers = {}
+    if KASHIER_SECRET:
+        headers["Authorization"] = KASHIER_SECRET  # حسب لوحة Integrations
+    params = {"merchantOrderId": merchant_order_id}
+    endpoints = [
+        "https://api.kashier.io/payments",
+        "https://api.kashier.io/orders",
+        "https://api.kashier.io/transactions",
+    ]
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as sess:
+        for url in endpoints:
+            try:
+                async with sess.get(url, params=params, headers=headers) as r:
+                    if r.status != 200:
+                        continue
+                    # أحياناً الـ content-type مش بيتظبط
+                    try:
+                        data = await r.json(content_type=None)
+                    except Exception:
+                        txt = await r.text()
+                        if '"status"' not in txt:
+                            continue
+                        # محاولة بدائية
+                        data = {"text": txt}
+                    if _json_has_paid(data):
+                        return True
+            except Exception:
+                continue
+    return False
+
 # ==================== USERS ====================
 async def get_or_create_user(uid: int) -> float:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -256,7 +306,7 @@ async def get_instruction(category: str, mode: str):
         cur = await db.execute("SELECT message_text FROM instructions WHERE category=? AND mode=?", (category, mode))
         row = await cur.fetchone(); return row[0] if row else None
 
-# ==================== USER COMMANDS (Deep-Link Ready) ====================
+# ==================== USER COMMANDS (Deep-Link + تحقق API) ====================
 PRETTY = {"personal":"فردي","shared":"مشترك","laptop":"لابتوب"}
 
 @dp.message(Command("start"))
@@ -266,8 +316,7 @@ async def cmd_start(m: Message, command: CommandObject):
     # Deep-Link: ok-<merchant_order_id>-<sig>
     if command.args and command.args.startswith("ok-"):
         try:
-            # payload قد يحتوي على أكثر من '-'؛ نفصل من الطرف الأخير للتوقيع
-            payload = command.args[3:]  # بعد "ok-"
+            payload = command.args[3:]
             ref, sig = payload.rsplit("-", 1)
             expected = hashlib.sha256((DEEPLINK_SECRET + ref).encode()).hexdigest()[:16]
             if sig != expected:
@@ -278,6 +327,12 @@ async def cmd_start(m: Message, command: CommandObject):
             uid = int(parts[1]); category = parts[2].replace("_"," "); mode = parts[3]
             if m.from_user.id != uid:
                 await m.answer("هذا الرابط ليس لحسابك."); return
+
+            # ✅ تحقق فعلي من كاشير
+            ok = await kashier_verify_paid(ref)
+            if not ok:
+                await m.answer("لم أتمكن من التأكد من الدفع الآن. من فضلك انتظر ثواني وجرب الزر مرة أخرى، أو أرسل لي Order ID لو ظهر لك.")
+                return
 
             row = await find_item_with_mode(category, mode)
             if not row:
@@ -405,7 +460,7 @@ async def _process_import_text(m: Message, text: str, mode_flag: str):
             bad+=1
     await m.reply(f"✅ تم استيراد: {ok} عنصر.\n❌ فشل: {bad} سطر.")
 
-# ==================== CATALOG / PAYMENT (Deep-Link Button Added) ====================
+# ==================== الكتالوج + زر الدفع + زر الاستلام ====================
 @dp.callback_query(F.data=="catalog")
 async def cb_catalog(c: CallbackQuery):
     cats = await list_categories_with_availability()
@@ -437,14 +492,12 @@ async def cb_pick_mode(c: CallbackQuery):
     safe_cat = re.sub(r'[^a-zA-Z0-9_-]+','_', category)
     merchant_order_id = f"buy-{c.from_user.id}-{safe_cat}-{mode}-{int(time.time())}"
 
-    # رابط الدفع
     pp_map = {"personal":PP_PERSONAL,"shared":PP_SHARED,"laptop":PP_LAPTOP}
     base_url = pp_map.get(mode,"")
     if not base_url: await c.answer("صفحة الدفع غير مجهزة.", show_alert=True); return
     sep = "&" if "?" in base_url else "?"
     pay_url = f"{base_url}{sep}ref={merchant_order_id}"
 
-    # زر الاستلام بعد الدفع (Deep-Link)
     me = await bot.get_me()
     sig = hashlib.sha256((DEEPLINK_SECRET + merchant_order_id).encode()).hexdigest()[:16]
     oklink = f"https://t.me/{me.username}?start=ok-{merchant_order_id}-{sig}"
@@ -459,7 +512,7 @@ async def cb_pick_mode(c: CallbackQuery):
         reply_markup=kb
     )
 
-# ==================== (اختياري) كول-باك كاشير إن توفر لاحقًا ====================
+# ==================== (اختياري) ويبهوك إن توفر لاحقًا ====================
 def _kashier_verify_signature(raw: bytes, sig: str|None) -> bool:
     if not sig: return False
     sig = sig.lower()
@@ -486,7 +539,7 @@ def kashier_callback():
         user_id = int(parts[1]); category = parts[2].replace("_"," "); mode = parts[3]
         async def finalize():
             row = await find_item_with_mode(category, mode)
-            if not row: 
+            if not row:
                 await bot.send_message(user_id, "⚠️ تمت عملية الدفع لكن العنصر غير متاح حالياً."); return
             stock_id, credential, price, cap, sold = row
             await increment_sale_and_finalize(stock_id)
