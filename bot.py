@@ -1,4 +1,6 @@
-﻿import os, re, time, hmac, hashlib, asyncio, html, threading
+import inspect
+import os, re, time, hmac, hashlib, asyncio, html, threading
+from functools import wraps
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.enums import ParseMode
@@ -322,9 +324,21 @@ async def cmd_whoami(m: Message):
 
 # ==================== ADMIN COMMANDS ====================
 def admin_only(func):
-    async def wrapper(m: Message, *a, **kw):
-        if not is_admin(m.from_user.id): return
-        return await func(m, *a, **kw)
+    signature = inspect.signature(func)
+    allowed = {
+        name
+        for name, param in signature.parameters.items()
+        if param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+    accepts_var_kw = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values())
+
+    @wraps(func)
+    async def wrapper(m: Message, *args, **kwargs):
+        if not is_admin(m.from_user.id):
+            return
+        filtered_kwargs = kwargs if accepts_var_kw else {k: kwargs[k] for k in allowed if k in kwargs}
+        return await func(m, *args, **filtered_kwargs)
+
     return wrapper
 
 @dp.message(Command("stock"))
