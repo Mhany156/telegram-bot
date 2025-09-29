@@ -100,7 +100,8 @@ async def cb_pick_mode(c: CallbackQuery):
     if not base_url:
         await c.answer("صفحة الدفع لهذا النوع غير مجهزة.", show_alert=True)
         return
-    pay_url = f"{base_url}?ref={merchant_order_id}"
+    sep = "&" if "?" in base_url else "?"
+    pay_url = f"{base_url}{sep}ref={merchant_order_id}"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"💳 ادفع {price:g} ج.م الآن", url=pay_url)],
         [InlineKeyboardButton(text="🔙 رجوع", callback_data=f"cat::{category}")]
