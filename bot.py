@@ -407,28 +407,33 @@ async def importstockm_cmd(m: Message):
 
 @dp.message(F.document)
 async def handle_import_doc(m: Message):
-    if not is_admin(m.from_user.id): return
-    st = ADMIN_IMPORT_STATE.get(m.from_user.id)
-    if not st: return
+    # Handler is only for admins in an import state
+    if not is_admin(m.from_user.id) or m.from_user.id not in ADMIN_IMPORT_STATE:
+        return
+
+    st = ADMIN_IMPORT_STATE.pop(m.from_user.id)  # Consume the state
     try:
         file = await bot.get_file(m.document.file_id)
         from io import BytesIO
         buf = BytesIO()
         await bot.download(file, buf)
         text = buf.getvalue().decode("utf-8", "ignore")
+        await _process_import_text(m, text, st["mode"])
     except Exception as e:
-        await m.reply(f"❌ فشل تنزيل الملف: {e}")
-        return
-    await _process_import_text(m, text, st["mode"])
-    ADMIN_IMPORT_STATE.pop(m.from_user.id, None)
+        await m.reply(f"❌ فشل معالجة الملف: {e}")
 
-@dp.message()
-async def handle_import_text(m: Message):
-    if not is_admin(m.from_user.id): return
-    st = ADMIN_IMPORT_STATE.get(m.from_user.id)
-    if not st or not m.text: return
-    await _process_import_text(m, m.text, st["mode"])
-    ADMIN_IMPORT_STATE.pop(m.from_user.id, None)
+@dp.message(F.text)
+async def handle_text(m: Message):
+    # If user is an admin performing an import
+    if is_admin(m.from_user.id) and m.from_user.id in ADMIN_IMPORT_STATE:
+        st = ADMIN_IMPORT_STATE.pop(m.from_user.id)  # Consume the state
+        if m.text:
+            await _process_import_text(m, m.text, st["mode"])
+        return
+
+    # Default reply for unhandled commands
+    if m.text and m.text.startswith('/'):
+        await m.reply("أمر غير معروف. اضغط /start لعرض الخيارات.")
 
 async def _process_import_text(m: Message, text: str, mode_flag: str):
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
